@@ -1,0 +1,1329 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/xuri/excelize/v2"
+	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite"
+)
+
+const (
+	appName        = "cfasuite-hr"
+	defaultPort    = "8217"
+	defaultDBPath  = "data/cfasuite-hr.db"
+	sessionCookie  = "cfasuite_hr_session"
+	sessionTTL     = 12 * time.Hour
+	banWindow      = 24 * time.Hour
+	maxLoginFails  = 5
+	maxUploadBytes = 20 << 20
+)
+
+var requiredColumns = []string{
+	"Employee Name",
+	"Employee Number",
+	"Job",
+	"Employee Status",
+	"Location Latest Start Date",
+}
+
+type App struct {
+	db            *sql.DB
+	sessionSecret []byte
+	adminUsername string
+	adminPassword string
+	adminHash     string
+}
+
+type Location struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Number    string    `json:"number"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Employees int       `json:"employee_count,omitempty"`
+}
+
+type Employee struct {
+	ID                      int64     `json:"id"`
+	LocationID              int64     `json:"location_id"`
+	EmployeeName            string    `json:"employee_name"`
+	EmployeeNumber          string    `json:"employee_number"`
+	Job                     string    `json:"job"`
+	EmployeeStatus          string    `json:"employee_status"`
+	LocationLatestStartDate string    `json:"location_latest_start_date"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+type Token struct {
+	ID         int64     `json:"id"`
+	Name       string    `json:"name"`
+	Prefix     string    `json:"prefix"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsedAt *string   `json:"last_used_at,omitempty"`
+}
+
+type ImportResult struct {
+	Added   int `json:"added"`
+	Updated int `json:"updated"`
+	Removed int `json:"removed"`
+	Skipped int `json:"skipped"`
+}
+
+type BioEmployee struct {
+	Name            string
+	Number          string
+	Job             string
+	Status          string
+	LatestStartDate string
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "serve":
+		cmdServe(os.Args[2:])
+	case "init":
+		cmdInit(os.Args[2:])
+	case "db":
+		cmdDB(os.Args[2:])
+	case "set-admin":
+		cmdSetAdmin(os.Args[2:])
+	case "admin-env":
+		cmdAdminEnv(os.Args[2:])
+	case "token":
+		cmdToken(os.Args[2:])
+	case "api-context":
+		cmdAPIContext(os.Args[2:])
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func usage() {
+	fmt.Printf(`%s
+
+Usage:
+  cfasuite-hr serve [-addr :8217] [-db data/cfasuite-hr.db]
+  cfasuite-hr init [-db data/cfasuite-hr.db]
+  cfasuite-hr db path [-db data/cfasuite-hr.db]
+  cfasuite-hr set-admin -username admin -password secret [-db data/cfasuite-hr.db]
+  cfasuite-hr admin-env -username admin -password secret
+  cfasuite-hr token create -name "Reporting" [-db data/cfasuite-hr.db]
+  cfasuite-hr token list [-db data/cfasuite-hr.db]
+  cfasuite-hr token delete -id 1 [-db data/cfasuite-hr.db]
+  cfasuite-hr api-context [-base-url http://localhost:8217]
+
+Environment:
+  CFASUITE_DB_PATH
+  CFASUITE_ADDR
+  CFASUITE_ADMIN_USERNAME
+  CFASUITE_ADMIN_PASSWORD
+  CFASUITE_SESSION_SECRET
+`, appName)
+}
+
+func cmdServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", env("CFASUITE_ADDR", ":"+defaultPort), "HTTP listen address")
+	dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+	fs.Parse(args)
+	db, err := openDB(*dbPath)
+	must(err)
+	defer db.Close()
+	must(migrate(db))
+	app, err := newApp(db)
+	must(err)
+	log.Printf("%s listening on %s", appName, *addr)
+	log.Printf("database: %s", abs(*dbPath))
+	must(http.ListenAndServe(*addr, app.routes()))
+}
+
+func cmdInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+	fs.Parse(args)
+	db, err := openDB(*dbPath)
+	must(err)
+	defer db.Close()
+	must(migrate(db))
+	fmt.Println(abs(*dbPath))
+}
+
+func cmdDB(args []string) {
+	if len(args) == 0 || args[0] != "path" {
+		fmt.Fprintln(os.Stderr, "usage: cfasuite-hr db path [-db data/cfasuite-hr.db]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("db path", flag.ExitOnError)
+	dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+	fs.Parse(args[1:])
+	fmt.Println(abs(*dbPath))
+}
+
+func cmdSetAdmin(args []string) {
+	fs := flag.NewFlagSet("set-admin", flag.ExitOnError)
+	dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+	username := fs.String("username", "", "admin username")
+	password := fs.String("password", "", "admin password")
+	fs.Parse(args)
+	if *username == "" || *password == "" {
+		must(errors.New("username and password are required"))
+	}
+	db, err := openDB(*dbPath)
+	must(err)
+	defer db.Close()
+	must(migrate(db))
+	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
+	must(err)
+	must(setSetting(db, "admin_username", *username))
+	must(setSetting(db, "admin_password_hash", string(hash)))
+	fmt.Printf("admin credentials saved in %s\n", abs(*dbPath))
+}
+
+func cmdAdminEnv(args []string) {
+	fs := flag.NewFlagSet("admin-env", flag.ExitOnError)
+	username := fs.String("username", "", "admin username")
+	password := fs.String("password", "", "admin password")
+	fs.Parse(args)
+	if *username == "" || *password == "" {
+		must(errors.New("username and password are required"))
+	}
+	fmt.Printf("export CFASUITE_ADMIN_USERNAME=%q\n", *username)
+	fmt.Printf("export CFASUITE_ADMIN_PASSWORD=%q\n", *password)
+}
+
+func cmdToken(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: cfasuite-hr token create|list|delete")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("token create", flag.ExitOnError)
+		dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+		name := fs.String("name", "", "token name")
+		fs.Parse(args[1:])
+		if *name == "" {
+			must(errors.New("token name is required"))
+		}
+		db := mustDB(*dbPath)
+		defer db.Close()
+		raw, token, err := createToken(db, *name)
+		must(err)
+		fmt.Printf("name: %s\nid: %d\nprefix: %s\ntoken: %s\n", token.Name, token.ID, token.Prefix, raw)
+	case "list":
+		fs := flag.NewFlagSet("token list", flag.ExitOnError)
+		dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+		fs.Parse(args[1:])
+		db := mustDB(*dbPath)
+		defer db.Close()
+		tokens, err := listTokens(db)
+		must(err)
+		for _, token := range tokens {
+			last := ""
+			if token.LastUsedAt != nil {
+				last = *token.LastUsedAt
+			}
+			fmt.Printf("%d\t%s\t%s\t%s\t%s\n", token.ID, token.Name, token.Prefix, token.CreatedAt.Format(time.RFC3339), last)
+		}
+	case "delete":
+		fs := flag.NewFlagSet("token delete", flag.ExitOnError)
+		dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+		id := fs.Int64("id", 0, "token id")
+		fs.Parse(args[1:])
+		if *id == 0 {
+			must(errors.New("token id is required"))
+		}
+		db := mustDB(*dbPath)
+		defer db.Close()
+		_, err := db.Exec(`DELETE FROM api_tokens WHERE id = ?`, *id)
+		must(err)
+		fmt.Println("deleted")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown token command: %s\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func cmdAPIContext(args []string) {
+	fs := flag.NewFlagSet("api-context", flag.ExitOnError)
+	baseURL := fs.String("base-url", "http://localhost:"+defaultPort, "base URL")
+	fs.Parse(args)
+	fmt.Print(apiContext(*baseURL))
+}
+
+func mustDB(path string) *sql.DB {
+	db, err := openDB(path)
+	must(err)
+	must(migrate(db))
+	return db
+}
+
+func openDB(path string) (*sql.DB, error) {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, db.Ping()
+}
+
+func migrate(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
+		`CREATE TABLE IF NOT EXISTS locations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			number TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS employees (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+			employee_name TEXT NOT NULL,
+			employee_number TEXT NOT NULL,
+			job TEXT NOT NULL,
+			employee_status TEXT NOT NULL,
+			location_latest_start_date TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(location_id, employee_number)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_employees_location ON employees(location_id)`,
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			prefix TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			last_used_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS login_attempts (
+			ip TEXT PRIMARY KEY,
+			attempts INTEGER NOT NULL,
+			banned INTEGER NOT NULL DEFAULT 0,
+			last_attempt_at TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newApp(db *sql.DB) (*App, error) {
+	secret := os.Getenv("CFASUITE_SESSION_SECRET")
+	if secret == "" {
+		var err error
+		secret, err = getSetting(db, "session_secret")
+		if err != nil {
+			return nil, err
+		}
+		if secret == "" {
+			secret = randomToken(32)
+			if err := setSetting(db, "session_secret", secret); err != nil {
+				return nil, err
+			}
+		}
+	}
+	username := os.Getenv("CFASUITE_ADMIN_USERNAME")
+	password := os.Getenv("CFASUITE_ADMIN_PASSWORD")
+	adminHash := ""
+	if username == "" || password == "" {
+		var err error
+		username, err = getSetting(db, "admin_username")
+		if err != nil {
+			return nil, err
+		}
+		adminHash, err = getSetting(db, "admin_password_hash")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &App{db: db, sessionSecret: []byte(secret), adminUsername: username, adminPassword: password, adminHash: adminHash}, nil
+}
+
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", a.requireAdmin(a.dashboard))
+	mux.HandleFunc("GET /login", a.loginPage)
+	mux.HandleFunc("POST /login", a.loginPost)
+	mux.HandleFunc("POST /logout", a.requireAdmin(a.logoutPost))
+	mux.HandleFunc("GET /locations/new", a.requireAdmin(a.locationNew))
+	mux.HandleFunc("POST /locations", a.requireAdmin(a.locationCreate))
+	mux.HandleFunc("GET /locations/{id}", a.requireAdmin(a.locationShow))
+	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
+	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
+	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
+	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
+	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
+	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
+	mux.HandleFunc("GET /docs", a.requireAdmin(a.docsPage))
+	mux.HandleFunc("GET /admin/api/context", a.requireAdmin(a.contextPage))
+	mux.HandleFunc("GET /assets/app.css", css)
+	mux.HandleFunc("GET /api/v1/locations", a.apiAuth(a.apiLocations))
+	mux.HandleFunc("GET /api/v1/locations/{number}/employees", a.apiAuth(a.apiEmployees))
+	mux.HandleFunc("GET /api/v1/locations/{number}/employees/{employeeNumber}", a.apiAuth(a.apiEmployee))
+	return securityHeaders(mux)
+}
+
+func (a *App) loginPage(w http.ResponseWriter, r *http.Request) {
+	a.render(w, "Login", loginHTML, map[string]any{"Configured": a.adminConfigured(), "Error": r.URL.Query().Get("error"), "LoggedOut": true})
+}
+
+func (a *App) loginPost(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	_ = purgeOldAttempts(a.db)
+	banned, _ := isBanned(a.db, ip)
+	if banned {
+		http.Error(w, "too many invalid attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+	if !a.adminConfigured() {
+		http.Redirect(w, r, "/login?error="+urlText("admin credentials are not configured"), http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if a.validAdmin(r.FormValue("username"), r.FormValue("password")) {
+		_ = clearAttempt(a.db, ip)
+		a.setSession(w, r.FormValue("username"))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	_ = recordFailedAttempt(a.db, ip)
+	http.Redirect(w, r, "/login?error="+urlText("invalid username or password"), http.StatusSeeOther)
+}
+
+func (a *App) logoutPost(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
+	locations, err := listLocations(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "Locations", dashboardHTML, map[string]any{"Locations": locations})
+}
+
+func (a *App) locationNew(w http.ResponseWriter, r *http.Request) {
+	a.render(w, "New Location", locationFormHTML, map[string]any{"Location": Location{}, "Action": "/locations", "Mode": "Create"})
+}
+
+func (a *App) locationCreate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id, err := createLocation(a.db, r.FormValue("name"), r.FormValue("number"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d", id), http.StatusSeeOther)
+}
+
+func (a *App) locationShow(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employees, err := listEmployees(a.db, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name, locationShowHTML, map[string]any{"Location": loc, "Employees": employees, "Import": r.URL.Query()})
+}
+
+func (a *App) locationUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := updateLocation(a.db, id, r.FormValue("name"), r.FormValue("number")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d", id), http.StatusSeeOther)
+}
+
+func (a *App) locationDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := a.db.Exec(`DELETE FROM locations WHERE id = ?`, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *App) locationUpload(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("bio")
+	if err != nil {
+		http.Error(w, "bio .xlsx file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	result, err := importBio(a.db, id, file, header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d?added=%d&updated=%d&removed=%d&skipped=%d", id, result.Added, result.Updated, result.Removed, result.Skipped), http.StatusSeeOther)
+}
+
+func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
+	tokens, err := listTokens(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "API Tokens", tokensHTML, map[string]any{"Tokens": tokens})
+}
+
+func (a *App) tokenCreate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	raw, token, err := createToken(a.db, r.FormValue("name"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	tokens, _ := listTokens(a.db)
+	a.render(w, "API Tokens", tokensHTML, map[string]any{"Tokens": tokens, "NewToken": raw, "NewTokenName": token.Name})
+}
+
+func (a *App) tokenDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := a.db.Exec(`DELETE FROM api_tokens WHERE id = ?`, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/tokens", http.StatusSeeOther)
+}
+
+func (a *App) docsPage(w http.ResponseWriter, r *http.Request) {
+	a.render(w, "API Docs", docsHTML, map[string]any{"BaseURL": absoluteBaseURL(r), "Context": apiContext(absoluteBaseURL(r))})
+}
+
+func (a *App) contextPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, apiContext(absoluteBaseURL(r)))
+}
+
+func (a *App) apiLocations(w http.ResponseWriter, r *http.Request) {
+	locations, err := listLocations(a.db)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"locations": locations})
+}
+
+func (a *App) apiEmployees(w http.ResponseWriter, r *http.Request) {
+	loc, err := getLocationByNumber(a.db, r.PathValue("number"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "location not found")
+		return
+	}
+	employees, err := listEmployees(a.db, loc.ID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"location": loc, "employees": employees})
+}
+
+func (a *App) apiEmployee(w http.ResponseWriter, r *http.Request) {
+	loc, err := getLocationByNumber(a.db, r.PathValue("number"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "location not found")
+		return
+	}
+	employee, err := getEmployee(a.db, loc.ID, r.PathValue("employeeNumber"))
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "employee not found")
+		return
+	}
+	writeJSON(w, map[string]any{"location": loc, "employee": employee})
+}
+
+func (a *App) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.validSession(r) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *App) apiAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" {
+			token = r.Header.Get("X-API-Token")
+		}
+		if token == "" || !validToken(a.db, token) {
+			writeJSONError(w, http.StatusUnauthorized, "valid API token required")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *App) adminConfigured() bool {
+	return a.adminUsername != "" && (a.adminPassword != "" || a.adminHash != "")
+}
+
+func (a *App) validAdmin(username, password string) bool {
+	if username != a.adminUsername {
+		return false
+	}
+	if a.adminPassword != "" {
+		return subtleEqual(a.adminPassword, password)
+	}
+	return bcrypt.CompareHashAndPassword([]byte(a.adminHash), []byte(password)) == nil
+}
+
+func (a *App) setSession(w http.ResponseWriter, username string) {
+	expires := time.Now().Add(sessionTTL).Unix()
+	payload := fmt.Sprintf("%s|%d", username, expires)
+	sig := sign(a.sessionSecret, payload)
+	value := base64.RawURLEncoding.EncodeToString([]byte(payload + "|" + sig))
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: value, Path: "/", Expires: time.Unix(expires, 0), HttpOnly: true, SameSite: http.SameSiteLaxMode})
+}
+
+func (a *App) validSession(r *http.Request) bool {
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(cookie.Value)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(string(decoded), "|")
+	if len(parts) != 3 {
+		return false
+	}
+	payload := parts[0] + "|" + parts[1]
+	if !subtleEqual(sign(a.sessionSecret, payload), parts[2]) {
+		return false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return false
+	}
+	return parts[0] == a.adminUsername
+}
+
+func (a *App) render(w http.ResponseWriter, title, body string, data map[string]any) {
+	data["Title"] = title
+	tmpl := template.Must(template.New("layout").Parse(layoutHTML + body))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := tmpl.ExecuteTemplate(w, "layout", data); err != nil {
+		log.Printf("render: %v", err)
+	}
+}
+
+func listLocations(db *sql.DB) ([]Location, error) {
+	rows, err := db.Query(`SELECT l.id, l.name, l.number, l.created_at, l.updated_at, COUNT(e.id)
+		FROM locations l
+		LEFT JOIN employees e ON e.location_id = l.id
+		GROUP BY l.id
+		ORDER BY l.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var locations []Location
+	for rows.Next() {
+		var loc Location
+		var created, updated string
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated, &loc.Employees); err != nil {
+			return nil, err
+		}
+		loc.CreatedAt = parseTime(created)
+		loc.UpdatedAt = parseTime(updated)
+		locations = append(locations, loc)
+	}
+	return locations, rows.Err()
+}
+
+func createLocation(db *sql.DB, name, number string) (int64, error) {
+	name = strings.TrimSpace(name)
+	number = strings.TrimSpace(number)
+	if name == "" || number == "" {
+		return 0, errors.New("name and number are required")
+	}
+	res, err := db.Exec(`INSERT INTO locations (name, number) VALUES (?, ?)`, name, number)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func updateLocation(db *sql.DB, id int64, name, number string) error {
+	name = strings.TrimSpace(name)
+	number = strings.TrimSpace(number)
+	if name == "" || number == "" {
+		return errors.New("name and number are required")
+	}
+	_, err := db.Exec(`UPDATE locations SET name = ?, number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, name, number, id)
+	return err
+}
+
+func getLocation(db *sql.DB, id int64) (Location, error) {
+	var loc Location
+	var created, updated string
+	err := db.QueryRow(`SELECT id, name, number, created_at, updated_at FROM locations WHERE id = ?`, id).Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated)
+	loc.CreatedAt = parseTime(created)
+	loc.UpdatedAt = parseTime(updated)
+	return loc, err
+}
+
+func getLocationByNumber(db *sql.DB, number string) (Location, error) {
+	var loc Location
+	var created, updated string
+	err := db.QueryRow(`SELECT id, name, number, created_at, updated_at FROM locations WHERE number = ?`, number).Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated)
+	loc.CreatedAt = parseTime(created)
+	loc.UpdatedAt = parseTime(updated)
+	return loc, err
+}
+
+func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
+	rows, err := db.Query(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, created_at, updated_at
+		FROM employees WHERE location_id = ? ORDER BY employee_name`, locationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var employees []Employee
+	for rows.Next() {
+		employee, err := scanEmployee(rows)
+		if err != nil {
+			return nil, err
+		}
+		employees = append(employees, employee)
+	}
+	return employees, rows.Err()
+}
+
+func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
+	row := db.QueryRow(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, created_at, updated_at
+		FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, number)
+	return scanEmployee(row)
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanEmployee(row scanner) (Employee, error) {
+	var e Employee
+	var created, updated string
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &e.EmployeeStatus, &e.LocationLatestStartDate, &created, &updated)
+	e.CreatedAt = parseTime(created)
+	e.UpdatedAt = parseTime(updated)
+	return e, err
+}
+
+func importBio(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
+	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".xlsx") {
+		return ImportResult{}, errors.New("employee bio must be an .xlsx file")
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	employees, err := parseBio(data)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	defer tx.Rollback()
+	active := map[string]BioEmployee{}
+	result := ImportResult{}
+	for _, employee := range employees {
+		if strings.EqualFold(employee.Status, "Terminated") || employee.Number == "" {
+			result.Skipped++
+			continue
+		}
+		active[employee.Number] = employee
+		var existingID int64
+		err := tx.QueryRow(`SELECT id FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, employee.Number).Scan(&existingID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+				VALUES (?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, "Active", employee.LatestStartDate)
+			if err != nil {
+				return ImportResult{}, err
+			}
+			result.Added++
+		case err != nil:
+			return ImportResult{}, err
+		default:
+			_, err = tx.Exec(`UPDATE employees SET employee_name = ?, job = ?, employee_status = ?, location_latest_start_date = ?, updated_at = CURRENT_TIMESTAMP
+				WHERE id = ?`, employee.Name, employee.Job, "Active", employee.LatestStartDate, existingID)
+			if err != nil {
+				return ImportResult{}, err
+			}
+			result.Updated++
+		}
+	}
+	rows, err := tx.Query(`SELECT employee_number FROM employees WHERE location_id = ?`, locationID)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	var remove []string
+	for rows.Next() {
+		var number string
+		if err := rows.Scan(&number); err != nil {
+			rows.Close()
+			return ImportResult{}, err
+		}
+		if _, ok := active[number]; !ok {
+			remove = append(remove, number)
+		}
+	}
+	rows.Close()
+	for _, number := range remove {
+		if _, err := tx.Exec(`DELETE FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, number); err != nil {
+			return ImportResult{}, err
+		}
+		result.Removed++
+	}
+	return result, tx.Commit()
+}
+
+func parseBio(data []byte) ([]BioEmployee, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil, errors.New("workbook has no sheets")
+	}
+	rows, err := f.GetRows(sheets[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("employee bio is empty")
+	}
+	headers := map[string]int{}
+	for i, h := range rows[0] {
+		headers[strings.TrimSpace(h)] = i
+	}
+	for _, col := range requiredColumns {
+		if _, ok := headers[col]; !ok {
+			return nil, fmt.Errorf("missing required column %q", col)
+		}
+	}
+	var employees []BioEmployee
+	for _, row := range rows[1:] {
+		employee := BioEmployee{
+			Name:            cell(row, headers["Employee Name"]),
+			Number:          cell(row, headers["Employee Number"]),
+			Job:             cell(row, headers["Job"]),
+			Status:          cell(row, headers["Employee Status"]),
+			LatestStartDate: cell(row, headers["Location Latest Start Date"]),
+		}
+		if employee.Name == "" && employee.Number == "" {
+			continue
+		}
+		employees = append(employees, employee)
+	}
+	return employees, nil
+}
+
+func cell(row []string, idx int) string {
+	if idx < 0 || idx >= len(row) {
+		return ""
+	}
+	return strings.TrimSpace(row[idx])
+}
+
+func createToken(db *sql.DB, name string) (string, Token, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", Token{}, errors.New("token name is required")
+	}
+	raw := "cfa_" + randomToken(32)
+	hash := tokenHash(raw)
+	prefix := raw
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+	res, err := db.Exec(`INSERT INTO api_tokens (name, token_hash, prefix) VALUES (?, ?, ?)`, name, hash, prefix)
+	if err != nil {
+		return "", Token{}, err
+	}
+	id, _ := res.LastInsertId()
+	return raw, Token{ID: id, Name: name, Prefix: prefix, CreatedAt: time.Now()}, nil
+}
+
+func listTokens(db *sql.DB) ([]Token, error) {
+	rows, err := db.Query(`SELECT id, name, prefix, created_at, last_used_at FROM api_tokens ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []Token
+	for rows.Next() {
+		var token Token
+		var created string
+		var last sql.NullString
+		if err := rows.Scan(&token.ID, &token.Name, &token.Prefix, &created, &last); err != nil {
+			return nil, err
+		}
+		token.CreatedAt = parseTime(created)
+		if last.Valid {
+			token.LastUsedAt = &last.String
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func validToken(db *sql.DB, raw string) bool {
+	hash := tokenHash(raw)
+	res, err := db.Exec(`UPDATE api_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = ?`, hash)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
+}
+
+func tokenHash(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func purgeOldAttempts(db *sql.DB) error {
+	_, err := db.Exec(`DELETE FROM login_attempts WHERE last_attempt_at < ?`, time.Now().Add(-banWindow).UTC().Format(time.RFC3339))
+	return err
+}
+
+func isBanned(db *sql.DB, ip string) (bool, error) {
+	var banned int
+	err := db.QueryRow(`SELECT banned FROM login_attempts WHERE ip = ?`, ip).Scan(&banned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return banned == 1, err
+}
+
+func recordFailedAttempt(db *sql.DB, ip string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.Exec(`INSERT INTO login_attempts (ip, attempts, banned, last_attempt_at) VALUES (?, 1, 0, ?)
+		ON CONFLICT(ip) DO UPDATE SET attempts = attempts + 1, banned = CASE WHEN attempts + 1 >= ? THEN 1 ELSE banned END, last_attempt_at = ?`,
+		ip, now, maxLoginFails, now)
+	return err
+}
+
+func clearAttempt(db *sql.DB, ip string) error {
+	_, err := db.Exec(`DELETE FROM login_attempts WHERE ip = ?`, ip)
+	return err
+}
+
+func setSetting(db *sql.DB, key, value string) error {
+	_, err := db.Exec(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`, key, value)
+	return err
+}
+
+func getSetting(db *sql.DB, key string) (string, error) {
+	var value string
+	err := db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return value, err
+}
+
+func apiContext(baseURL string) string {
+	return fmt.Sprintf(`# cfasuite-hr API Context
+
+Base URL: %s
+
+Authentication:
+Send an API token with either header:
+Authorization: Bearer <token>
+X-API-Token: <token>
+
+Endpoints:
+GET /api/v1/locations
+Returns all Chick-fil-A locations with id, name, number, and employee_count.
+
+GET /api/v1/locations/{storeNumber}/employees
+Returns active employees for a location. Store numbers are strings, so leading zeroes matter.
+
+GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}
+Returns one employee by employee number.
+
+Go example:
+
+package cfasuitehr
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+type Employee struct {
+	ID                      int64  `+"`json:\"id\"`"+`
+	EmployeeName            string `+"`json:\"employee_name\"`"+`
+	EmployeeNumber          string `+"`json:\"employee_number\"`"+`
+	Job                     string `+"`json:\"job\"`"+`
+	EmployeeStatus          string `+"`json:\"employee_status\"`"+`
+	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
+}
+
+func Employees(baseURL, token, storeNumber string) ([]Employee, error) {
+	req, err := http.NewRequest("GET", baseURL+"/api/v1/locations/"+storeNumber+"/employees", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cfasuite-hr returned %%s", res.Status)
+	}
+	var payload struct {
+		Employees []Employee `+"`json:\"employees\"`"+`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload.Employees, nil
+}
+`, strings.TrimRight(baseURL, "/"))
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(value)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": message})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func css(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	fmt.Fprint(w, appCSS)
+}
+
+func pathID(r *http.Request, name string) (int64, error) {
+	return strconv.ParseInt(r.PathValue(name), 10, 64)
+}
+
+func randomToken(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func sign(secret []byte, payload string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func subtleEqual(a, b string) bool {
+	return hmac.Equal([]byte(a), []byte(b))
+}
+
+func clientIP(r *http.Request) string {
+	for _, header := range []string{"X-Forwarded-For", "X-Real-IP"} {
+		value := r.Header.Get(header)
+		if value != "" {
+			return strings.TrimSpace(strings.Split(value, ",")[0])
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func absoluteBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func urlText(s string) string {
+	return strings.ReplaceAll(s, " ", "+")
+}
+
+func env(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func abs(path string) string {
+	out, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return out
+}
+
+func parseTime(value string) time.Time {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+const layoutHTML = `{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} | cfasuite-hr</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">cfasuite-hr</a>
+    {{if not .LoggedOut}}<nav>
+      <a href="/">Locations</a>
+      <a href="/tokens">API Tokens</a>
+      <a href="/docs">API Docs</a>
+      <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
+    </nav>{{end}}
+  </header>
+  <main>{{template "body" .}}</main>
+</body>
+</html>{{end}}`
+
+const loginHTML = `{{define "body"}}
+<section class="narrow">
+  <h1>Admin Login</h1>
+  {{if .Error}}<p class="notice bad">{{.Error}}</p>{{end}}
+  {{if not .Configured}}<p class="notice bad">Admin credentials are not configured. Set CFASUITE_ADMIN_USERNAME and CFASUITE_ADMIN_PASSWORD or run the set-admin CLI command.</p>{{end}}
+  <form method="post" action="/login" class="panel">
+    <label>Username <input name="username" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button>Log in</button>
+  </form>
+</section>
+{{end}}`
+
+const dashboardHTML = `{{define "body"}}
+<div class="row">
+  <h1>Locations</h1>
+  <a class="button" href="/locations/new">New location</a>
+</div>
+<section class="grid">
+{{range .Locations}}
+  <article class="card">
+    <h2>{{.Name}}</h2>
+    <p class="muted">Store {{.Number}}</p>
+    <p>{{.Employees}} active employees</p>
+    <a class="button secondary" href="/locations/{{.ID}}">Manage</a>
+  </article>
+{{else}}
+  <p class="empty">No locations yet.</p>
+{{end}}
+</section>
+{{end}}`
+
+const locationFormHTML = `{{define "body"}}
+<section class="narrow">
+  <h1>{{.Mode}} Location</h1>
+  <form method="post" action="{{.Action}}" class="panel">
+    <label>Name <input name="name" value="{{.Location.Name}}" required></label>
+    <label>Store number <input name="number" value="{{.Location.Number}}" required></label>
+    <button>{{.Mode}}</button>
+  </form>
+</section>
+{{end}}`
+
+const locationShowHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}}</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+  <form method="post" action="/locations/{{.Location.ID}}/delete" onsubmit="return confirm('Delete this location and its employees?')"><button class="danger">Delete</button></form>
+</div>
+<section class="split">
+  <form method="post" action="/locations/{{.Location.ID}}" class="panel">
+    <h2>Edit location</h2>
+    <label>Name <input name="name" value="{{.Location.Name}}" required></label>
+    <label>Store number <input name="number" value="{{.Location.Number}}" required></label>
+    <button>Save</button>
+  </form>
+  <form method="post" action="/locations/{{.Location.ID}}/upload" enctype="multipart/form-data" class="panel">
+    <h2>Upload employee bio</h2>
+    <p class="muted">This syncs active employees for this location and removes terminated or missing employees.</p>
+    <input type="file" name="bio" accept=".xlsx" required>
+    <button>Upload .xlsx</button>
+  </form>
+</section>
+<section>
+  <h2>Employees</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Status</th><th>Latest start</th></tr></thead>
+    <tbody>
+    {{range .Employees}}<tr><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{.EmployeeStatus}}</td><td>{{.LocationLatestStartDate}}</td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}`
+
+const tokensHTML = `{{define "body"}}
+<div class="row"><h1>API Tokens</h1></div>
+{{if .NewToken}}<section class="notice"><strong>{{.NewTokenName}}</strong><code>{{.NewToken}}</code><p>Copy this now. It will not be shown again.</p></section>{{end}}
+<form method="post" action="/tokens" class="panel inline">
+  <label>Name <input name="name" required></label>
+  <button>Create token</button>
+</form>
+<table>
+  <thead><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+  <tbody>{{range .Tokens}}<tr><td>{{.Name}}</td><td>{{.Prefix}}</td><td>{{.CreatedAt}}</td><td>{{if .LastUsedAt}}{{.LastUsedAt}}{{end}}</td><td><form method="post" action="/tokens/{{.ID}}/delete"><button class="danger small">Delete</button></form></td></tr>{{else}}<tr><td colspan="5">No tokens created.</td></tr>{{end}}</tbody>
+</table>
+{{end}}`
+
+const docsHTML = `{{define "body"}}
+<h1>API Docs</h1>
+<section class="panel">
+  <h2>Authentication</h2>
+  <p>Use <code>Authorization: Bearer &lt;token&gt;</code> or <code>X-API-Token: &lt;token&gt;</code>.</p>
+</section>
+<section class="panel">
+  <h2>Endpoints</h2>
+  <p><code>GET {{.BaseURL}}/api/v1/locations</code></p>
+  <p><code>GET {{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></p>
+  <p><code>GET {{.BaseURL}}/api/v1/locations/{storeNumber}/employees/{employeeNumber}</code></p>
+</section>
+<section>
+  <h2>LLM context and Go example</h2>
+  <pre>{{.Context}}</pre>
+</section>
+{{end}}`
+
+const appCSS = `
+:root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline{display:block}.row>*{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+`

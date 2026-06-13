@@ -102,6 +102,14 @@ Given a store number and an api token, external systems can access employees and
 
 The api should have a documentation page where you can go read about the different endpoints and how they operate. Maybe even you can send mock requests from these endpoints to see how they operate. Of course, all this lives on the admin side of things.
 
+# Employee Birthday Reports
+
+The application supports uploading the Employee Birthday Reader `.xlsx` report from the admin dashboard. The report contains `Employee Name` and `Birth Date` columns. Birthdays are matched to existing employees by exact employee name across all locations and stored as `YYYY-MM-DD`.
+
+Employees may exist without a birthday. In that case the API returns `birth_date` as `null`. Uploading a new employee bio does not erase existing birthday data for employees who remain active.
+
+The API documentation and generated LLM context must describe how to read birthdays from employee API responses.
+
 # The UI
 
 The UI should be fairly simple as this is not a user-facing application. Only the admin will really interact with the ui.
@@ -137,3 +145,4 @@ This allows us to have a database which will ban ips who abuse the system, but w
 Please create a makefile and within have a command for 'make install' which will install this application on our system (or whatever system is installing it)
 
 This should make it trivial for someone to just pull down the repo and run make install to get things up and running quickly.
+

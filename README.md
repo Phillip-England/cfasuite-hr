@@ -46,7 +46,7 @@ cfasuite-hr serve
 cfasuite-hr token create -name "Reporting"
 cfasuite-hr token list
 cfasuite-hr token delete -id 1
-cfasuite-hr api-context -base-url http://localhost:8217
+cfasuite-hr api-context -base-url https://hr.example.com
 ```
 
 `db path` prints the SQLite file path so you can inspect or copy it. The application itself does not require the `sqlite3` CLI, but if you have it installed you can run:
@@ -67,6 +67,15 @@ Create a location in the admin UI, then upload the employee bio `.xlsx` for that
 
 Rows with `Employee Status` equal to `Terminated` are skipped. Existing employees missing from the new active set are removed for that location.
 
+## Birthday Report Imports
+
+Upload the Employee Birthday Reader `.xlsx` report from the Locations dashboard. The report must contain:
+
+- `Employee Name`
+- `Birth Date`
+
+The importer matches birthdays to current employees by exact employee name across all locations. It stores birthdays as `YYYY-MM-DD`. Employees that do not have a matching birthday report row keep `birth_date` as `null` in the API.
+
 ## API
 
 Create an API token in the admin UI or CLI. Use either:
@@ -85,6 +94,31 @@ GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}
 ```
 
 Store numbers are strings, so leading zeroes such as `03394` are preserved.
+
+Employee responses include:
+
+- `employee_name`
+- `employee_number`
+- `job`
+- `employee_status`
+- `location_latest_start_date`
+- `birth_date` as `YYYY-MM-DD` or `null`
+
+Example:
+
+```sh
+curl -sS \
+  -H "Authorization: Bearer $CFASUITE_TOKEN" \
+  "https://hr.example.com/api/v1/locations/03394/employees"
+```
+
+To generate a complete copy/paste context block for a large language model or another developer, pass the public endpoint where the app is running:
+
+```sh
+cfasuite-hr api-context -base-url https://hr.example.com
+```
+
+The generated context includes exact URLs, auth headers, response shapes, birthday behavior, cURL examples, and a Go client example.
 
 ## Docker
 

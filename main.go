@@ -49,6 +49,11 @@ var requiredColumns = []string{
 	"Location Latest Start Date",
 }
 
+var requiredBirthdayColumns = []string{
+	"Employee Name",
+	"Birth Date",
+}
+
 type App struct {
 	db            *sql.DB
 	sessionSecret []byte
@@ -74,6 +79,7 @@ type Employee struct {
 	Job                     string    `json:"job"`
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
+	BirthDate               *string   `json:"birth_date"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
@@ -99,6 +105,11 @@ type BioEmployee struct {
 	Job             string
 	Status          string
 	LatestStartDate string
+}
+
+type BirthdayEmployee struct {
+	Name      string
+	BirthDate string
 }
 
 func main() {
@@ -142,7 +153,7 @@ Usage:
   cfasuite-hr token create -name "Reporting" [-db data/cfasuite-hr.db]
   cfasuite-hr token list [-db data/cfasuite-hr.db]
   cfasuite-hr token delete -id 1 [-db data/cfasuite-hr.db]
-  cfasuite-hr api-context [-base-url http://localhost:8217]
+  cfasuite-hr api-context -base-url https://hr.example.com
 
 Environment:
   CFASUITE_DB_PATH
@@ -278,9 +289,14 @@ func cmdToken(args []string) {
 
 func cmdAPIContext(args []string) {
 	fs := flag.NewFlagSet("api-context", flag.ExitOnError)
-	baseURL := fs.String("base-url", "http://localhost:"+defaultPort, "base URL")
+	baseURL := ""
+	fs.StringVar(&baseURL, "base-url", "", "public base URL where cfasuite-hr is running")
+	fs.StringVar(&baseURL, "endpoint", "", "public base URL where cfasuite-hr is running")
 	fs.Parse(args)
-	fmt.Print(apiContext(*baseURL))
+	if baseURL == "" {
+		must(errors.New("api-context requires -base-url, for example: cfasuite-hr api-context -base-url https://hr.example.com"))
+	}
+	fmt.Print(apiContext(baseURL))
 }
 
 func mustDB(path string) *sql.DB {
@@ -323,6 +339,7 @@ func migrate(db *sql.DB) error {
 			job TEXT NOT NULL,
 			employee_status TEXT NOT NULL,
 			location_latest_start_date TEXT NOT NULL,
+			birth_date TEXT,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(location_id, employee_number)
@@ -348,7 +365,36 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if err := ensureColumn(db, "employees", "birth_date", "TEXT"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func ensureColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func newApp(db *sql.DB) (*App, error) {
@@ -395,6 +441,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
+	mux.HandleFunc("POST /birthdays/upload", a.requireAdmin(a.birthdayUpload))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
 	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
 	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
@@ -448,7 +495,7 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "Locations", dashboardHTML, map[string]any{"Locations": locations})
+	a.render(w, "Locations", dashboardHTML, map[string]any{"Locations": locations, "Import": r.URL.Query()})
 }
 
 func (a *App) locationNew(w http.ResponseWriter, r *http.Request) {
@@ -540,6 +587,26 @@ func (a *App) locationUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d?added=%d&updated=%d&removed=%d&skipped=%d", id, result.Added, result.Updated, result.Removed, result.Skipped), http.StatusSeeOther)
+}
+
+func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("birthdays")
+	if err != nil {
+		http.Error(w, "birthday report .xlsx file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	result, err := importBirthdays(a.db, file, header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/?birthday_updated=%d&birthday_skipped=%d", result.Updated, result.Skipped), http.StatusSeeOther)
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -769,7 +836,7 @@ func getLocationByNumber(db *sql.DB, number string) (Location, error) {
 }
 
 func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, created_at, updated_at
+	rows, err := db.Query(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, birth_date, created_at, updated_at
 		FROM employees WHERE location_id = ? ORDER BY employee_name`, locationID)
 	if err != nil {
 		return nil, err
@@ -787,7 +854,7 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, created_at, updated_at
+	row := db.QueryRow(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, birth_date, created_at, updated_at
 		FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, number)
 	return scanEmployee(row)
 }
@@ -799,7 +866,11 @@ type scanner interface {
 func scanEmployee(row scanner) (Employee, error) {
 	var e Employee
 	var created, updated string
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &e.EmployeeStatus, &e.LocationLatestStartDate, &created, &updated)
+	var birthDate sql.NullString
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
+	if birthDate.Valid {
+		e.BirthDate = &birthDate.String
+	}
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
 	return e, err
@@ -876,6 +947,39 @@ func importBio(db *sql.DB, locationID int64, file multipart.File, header *multip
 	return result, tx.Commit()
 }
 
+func importBirthdays(db *sql.DB, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
+	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".xlsx") {
+		return ImportResult{}, errors.New("birthday report must be an .xlsx file")
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	birthdays, err := parseBirthdays(data)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	defer tx.Rollback()
+	result := ImportResult{}
+	for _, birthday := range birthdays {
+		res, err := tx.Exec(`UPDATE employees SET birth_date = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_name = ?`, birthday.BirthDate, birthday.Name)
+		if err != nil {
+			return ImportResult{}, err
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			result.Skipped++
+			continue
+		}
+		result.Updated += int(affected)
+	}
+	return result, tx.Commit()
+}
+
 func parseBio(data []byte) ([]BioEmployee, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {
@@ -919,11 +1023,71 @@ func parseBio(data []byte) ([]BioEmployee, error) {
 	return employees, nil
 }
 
+func parseBirthdays(data []byte) ([]BirthdayEmployee, error) {
+	f, err := excelize.OpenReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sheets := f.GetSheetList()
+	if len(sheets) == 0 {
+		return nil, errors.New("workbook has no sheets")
+	}
+	rows, err := f.GetRows(sheets[0])
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, errors.New("birthday report is empty")
+	}
+	headers := map[string]int{}
+	for i, h := range rows[0] {
+		headers[strings.TrimSpace(h)] = i
+	}
+	for _, col := range requiredBirthdayColumns {
+		if _, ok := headers[col]; !ok {
+			return nil, fmt.Errorf("missing required column %q", col)
+		}
+	}
+	var birthdays []BirthdayEmployee
+	for _, row := range rows[1:] {
+		name := cell(row, headers["Employee Name"])
+		birthDate := normalizeDate(cell(row, headers["Birth Date"]))
+		if name == "" || birthDate == "" {
+			continue
+		}
+		birthdays = append(birthdays, BirthdayEmployee{Name: name, BirthDate: birthDate})
+	}
+	return birthdays, nil
+}
+
 func cell(row []string, idx int) string {
 	if idx < 0 || idx >= len(row) {
 		return ""
 	}
 	return strings.TrimSpace(row[idx])
+}
+
+func normalizeDate(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	for _, layout := range []string{
+		"2006-01-02",
+		"1/2/2006",
+		"01/02/2006",
+		"1/2/06",
+		"01/02/06",
+		"2006/01/02",
+		"1-2-2006",
+		"01-02-2006",
+	} {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	return value
 }
 
 func createToken(db *sql.DB, name string) (string, Token, error) {
@@ -1030,20 +1194,81 @@ func apiContext(baseURL string) string {
 
 Base URL: %s
 
+Purpose:
+cfasuite-hr exposes Chick-fil-A restaurant locations and active employee records to other systems.
+Employee records come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files.
+
 Authentication:
 Send an API token with either header:
 Authorization: Bearer <token>
 X-API-Token: <token>
 
+Tokens:
+Create tokens in the admin UI at %s/tokens or with:
+cfasuite-hr token create -name "Reporting"
+
+Important data rules:
+- Store/location numbers are strings. Preserve leading zeroes such as "03394".
+- Employee numbers are strings.
+- Employees are active employees from the latest employee bio import.
+- birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
+- Birthday reports match employees by exact Employee Name.
+
 Endpoints:
 GET /api/v1/locations
-Returns all Chick-fil-A locations with id, name, number, and employee_count.
+Full URL: %s/api/v1/locations
+Returns all Chick-fil-A locations with id, name, number, employee_count, created_at, and updated_at.
+
+Example response:
+{
+  "locations": [
+    {
+      "id": 1,
+      "name": "Southroads",
+      "number": "03394",
+      "employee_count": 42,
+      "created_at": "2026-06-13T12:00:00Z",
+      "updated_at": "2026-06-13T12:00:00Z"
+    }
+  ]
+}
 
 GET /api/v1/locations/{storeNumber}/employees
+Full URL: %s/api/v1/locations/{storeNumber}/employees
 Returns active employees for a location. Store numbers are strings, so leading zeroes matter.
 
+Example response:
+{
+  "location": {"id": 1, "name": "Southroads", "number": "03394"},
+  "employees": [
+    {
+      "id": 10,
+      "location_id": 1,
+      "employee_name": "Blanco, John",
+      "employee_number": "12-1083836",
+      "job": "Team Member",
+      "employee_status": "Active",
+      "location_latest_start_date": "2024-10-01",
+      "birth_date": "1999-03-14",
+      "created_at": "2026-06-13T12:00:00Z",
+      "updated_at": "2026-06-13T12:00:00Z"
+    }
+  ]
+}
+
 GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}
+Full URL: %s/api/v1/locations/{storeNumber}/employees/{employeeNumber}
 Returns one employee by employee number.
+
+Errors:
+- 401 {"error":"valid API token required"} when the token is missing or invalid.
+- 404 {"error":"location not found"} when the store number does not exist.
+- 404 {"error":"employee not found"} when the employee number does not exist at that store.
+
+cURL examples:
+curl -sS -H "Authorization: Bearer $CFASUITE_TOKEN" "%s/api/v1/locations"
+curl -sS -H "Authorization: Bearer $CFASUITE_TOKEN" "%s/api/v1/locations/03394/employees"
+curl -sS -H "Authorization: Bearer $CFASUITE_TOKEN" "%s/api/v1/locations/03394/employees/12-1083836"
 
 Go example:
 
@@ -1057,11 +1282,13 @@ import (
 
 type Employee struct {
 	ID                      int64  `+"`json:\"id\"`"+`
+	LocationID              int64  `+"`json:\"location_id\"`"+`
 	EmployeeName            string `+"`json:\"employee_name\"`"+`
 	EmployeeNumber          string `+"`json:\"employee_number\"`"+`
 	Job                     string `+"`json:\"job\"`"+`
 	EmployeeStatus          string `+"`json:\"employee_status\"`"+`
 	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
+	BirthDate               *string `+"`json:\"birth_date\"`"+`
 }
 
 func Employees(baseURL, token, storeNumber string) ([]Employee, error) {
@@ -1086,7 +1313,7 @@ func Employees(baseURL, token, storeNumber string) ([]Employee, error) {
 	}
 	return payload.Employees, nil
 }
-`, strings.TrimRight(baseURL, "/"))
+`, strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"), strings.TrimRight(baseURL, "/"))
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
@@ -1233,6 +1460,15 @@ const dashboardHTML = `{{define "body"}}
   <h1>Locations</h1>
   <a class="button" href="/locations/new">New location</a>
 </div>
+{{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees.</p>{{end}}
+<section class="panel">
+  <h2>Upload birthday report</h2>
+  <p class="muted">Upload the Employee Birthday Reader .xlsx report. It reads Employee Name and Birth Date, then applies birthdays to matching employees across all locations.</p>
+  <form method="post" action="/birthdays/upload" enctype="multipart/form-data" class="inline">
+    <label>Birthday report <input type="file" name="birthdays" accept=".xlsx" required></label>
+    <button>Upload birthdays</button>
+  </form>
+</section>
 <section class="grid">
 {{range .Locations}}
   <article class="card">
@@ -1283,9 +1519,9 @@ const locationShowHTML = `{{define "body"}}
 <section>
   <h2>Employees</h2>
   <table>
-    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Status</th><th>Latest start</th></tr></thead>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Status</th><th>Latest start</th><th>Birthday</th></tr></thead>
     <tbody>
-    {{range .Employees}}<tr><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{.EmployeeStatus}}</td><td>{{.LocationLatestStartDate}}</td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}<tr><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{.EmployeeStatus}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
     </tbody>
   </table>
 </section>
@@ -1312,9 +1548,18 @@ const docsHTML = `{{define "body"}}
 </section>
 <section class="panel">
   <h2>Endpoints</h2>
-  <p><code>GET {{.BaseURL}}/api/v1/locations</code></p>
-  <p><code>GET {{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></p>
-  <p><code>GET {{.BaseURL}}/api/v1/locations/{storeNumber}/employees/{employeeNumber}</code></p>
+  <table>
+    <thead><tr><th>Method</th><th>URL</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations</code></td><td>Locations with store numbers and employee counts.</td></tr>
+      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></td><td>Active employees for one store, including <code>birth_date</code> when known.</td></tr>
+      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees/{employeeNumber}</code></td><td>One active employee by employee number.</td></tr>
+    </tbody>
+  </table>
+</section>
+<section class="panel">
+  <h2>Employee birthdays</h2>
+  <p>Birthdays are imported from an Employee Birthday Reader .xlsx file with <code>Employee Name</code> and <code>Birth Date</code> columns. The API returns <code>birth_date</code> as <code>YYYY-MM-DD</code> when known and <code>null</code> when no birthday has been imported for that employee.</p>
 </section>
 <section>
   <h2>LLM context and Go example</h2>

@@ -88,7 +88,7 @@ func TestParseBirthdays(t *testing.T) {
 	}
 }
 
-func TestImportBirthdaysUpdatesMatchingEmployees(t *testing.T) {
+func TestImportBirthdaysUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
@@ -101,17 +101,26 @@ func TestImportBirthdaysUpdatesMatchingEmployees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
+	otherLocationID, err := createLocation(db, "Northroads", "01234")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
 	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
 		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
 	if err != nil {
 		t.Fatalf("insert employee: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, otherLocationID, "Blanco, John", "99-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert other employee: %v", err)
 	}
 	data := birthdayWorkbook(t, [][]string{
 		{"Employee Name", "Birth Date"},
 		{"Blanco, John", "3/14/1999"},
 		{"Missing, Person", "1/2/2000"},
 	})
-	result, err := importBirthdays(db, multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "birthdays.xlsx"})
+	result, err := importBirthdays(db, locationID, multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "birthdays.xlsx"})
 	if err != nil {
 		t.Fatalf("importBirthdays: %v", err)
 	}
@@ -124,6 +133,13 @@ func TestImportBirthdaysUpdatesMatchingEmployees(t *testing.T) {
 	}
 	if employee.BirthDate == nil || *employee.BirthDate != "1999-03-14" {
 		t.Fatalf("birth date was not imported: %#v", employee)
+	}
+	otherEmployee, err := getEmployee(db, otherLocationID, "99-1083836")
+	if err != nil {
+		t.Fatalf("get other employee: %v", err)
+	}
+	if otherEmployee.BirthDate != nil {
+		t.Fatalf("birthday import crossed location boundary: %#v", otherEmployee)
 	}
 }
 

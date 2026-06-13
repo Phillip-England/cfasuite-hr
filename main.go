@@ -441,7 +441,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
-	mux.HandleFunc("POST /birthdays/upload", a.requireAdmin(a.birthdayUpload))
+	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
 	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
 	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
@@ -590,6 +590,15 @@ func (a *App) locationUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -601,12 +610,12 @@ func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	result, err := importBirthdays(a.db, file, header)
+	result, err := importBirthdays(a.db, id, file, header)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/?birthday_updated=%d&birthday_skipped=%d", result.Updated, result.Skipped), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d?birthday_updated=%d&birthday_skipped=%d", id, result.Updated, result.Skipped), http.StatusSeeOther)
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -947,7 +956,7 @@ func importBio(db *sql.DB, locationID int64, file multipart.File, header *multip
 	return result, tx.Commit()
 }
 
-func importBirthdays(db *sql.DB, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
+func importBirthdays(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
 	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".xlsx") {
 		return ImportResult{}, errors.New("birthday report must be an .xlsx file")
 	}
@@ -966,7 +975,7 @@ func importBirthdays(db *sql.DB, file multipart.File, header *multipart.FileHead
 	defer tx.Rollback()
 	result := ImportResult{}
 	for _, birthday := range birthdays {
-		res, err := tx.Exec(`UPDATE employees SET birth_date = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_name = ?`, birthday.BirthDate, birthday.Name)
+		res, err := tx.Exec(`UPDATE employees SET birth_date = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND employee_name = ?`, birthday.BirthDate, locationID, birthday.Name)
 		if err != nil {
 			return ImportResult{}, err
 		}
@@ -1212,7 +1221,7 @@ Important data rules:
 - Employee numbers are strings.
 - Employees are active employees from the latest employee bio import.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
-- Birthday reports match employees by exact Employee Name.
+- Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
 
 Endpoints:
 GET /api/v1/locations
@@ -1460,15 +1469,6 @@ const dashboardHTML = `{{define "body"}}
   <h1>Locations</h1>
   <a class="button" href="/locations/new">New location</a>
 </div>
-{{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees.</p>{{end}}
-<section class="panel">
-  <h2>Upload birthday report</h2>
-  <p class="muted">Upload the Employee Birthday Reader .xlsx report. It reads Employee Name and Birth Date, then applies birthdays to matching employees across all locations.</p>
-  <form method="post" action="/birthdays/upload" enctype="multipart/form-data" class="inline">
-    <label>Birthday report <input type="file" name="birthdays" accept=".xlsx" required></label>
-    <button>Upload birthdays</button>
-  </form>
-</section>
 <section class="grid">
 {{range .Locations}}
   <article class="card">
@@ -1502,6 +1502,7 @@ const locationShowHTML = `{{define "body"}}
   </div>
   <form method="post" action="/locations/{{.Location.ID}}/delete" onsubmit="return confirm('Delete this location and its employees?')"><button class="danger">Delete</button></form>
 </div>
+{{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported for {{.Location.Name}}. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees at this location.</p>{{end}}
 <section class="split">
   <form method="post" action="/locations/{{.Location.ID}}" class="panel">
     <h2>Edit location</h2>
@@ -1514,6 +1515,12 @@ const locationShowHTML = `{{define "body"}}
     <p class="muted">This syncs active employees for this location and removes terminated or missing employees.</p>
     <input type="file" name="bio" accept=".xlsx" required>
     <button>Upload .xlsx</button>
+  </form>
+  <form method="post" action="/locations/{{.Location.ID}}/birthdays/upload" enctype="multipart/form-data" class="panel">
+    <h2>Upload birthday report</h2>
+    <p class="muted">This applies Employee Birthday Reader rows only to matching employees at this location.</p>
+    <input type="file" name="birthdays" accept=".xlsx" required>
+    <button>Upload birthdays</button>
   </form>
 </section>
 <section>

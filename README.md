@@ -69,12 +69,12 @@ Rows with `Employee Status` equal to `Terminated` are skipped. Existing employee
 
 ## Birthday Report Imports
 
-Upload the Employee Birthday Reader `.xlsx` report from the Locations dashboard. The report must contain:
+Open a location in the admin UI, then upload the Employee Birthday Reader `.xlsx` report for that location. The report must contain:
 
 - `Employee Name`
 - `Birth Date`
 
-The importer matches birthdays to current employees by exact employee name across all locations. It stores birthdays as `YYYY-MM-DD`. Employees that do not have a matching birthday report row keep `birth_date` as `null` in the API.
+The importer matches birthdays to current employees at the selected location by exact employee name. It stores birthdays as `YYYY-MM-DD`. Employees that do not have a matching birthday report row keep `birth_date` as `null` in the API.
 
 ## API
 

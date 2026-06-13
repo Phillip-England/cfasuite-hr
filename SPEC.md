@@ -104,7 +104,7 @@ The api should have a documentation page where you can go read about the differe
 
 # Employee Birthday Reports
 
-The application supports uploading the Employee Birthday Reader `.xlsx` report from the admin dashboard. The report contains `Employee Name` and `Birth Date` columns. Birthdays are matched to existing employees by exact employee name across all locations and stored as `YYYY-MM-DD`.
+The application supports uploading the Employee Birthday Reader `.xlsx` report for a specific location. The report contains `Employee Name` and `Birth Date` columns. Birthdays are matched to existing employees at the selected location by exact employee name and stored as `YYYY-MM-DD`.
 
 Employees may exist without a birthday. In that case the API returns `birth_date` as `null`. Uploading a new employee bio does not erase existing birthday data for employees who remain active.
 
@@ -145,4 +145,3 @@ This allows us to have a database which will ban ips who abuse the system, but w
 Please create a makefile and within have a command for 'make install' which will install this application on our system (or whatever system is installing it)
 
 This should make it trivial for someone to just pull down the repo and run make install to get things up and running quickly.
-

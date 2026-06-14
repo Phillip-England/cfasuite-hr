@@ -112,6 +112,51 @@ func TestEmployeeRolesAreAssignedSeparatelyFromJobs(t *testing.T) {
 	}
 }
 
+func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	departmentID, err := createDepartment(db, "Front of House")
+	if err != nil {
+		t.Fatalf("createDepartment: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employees, err := listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	if len(employees) != 1 || employees[0].DepartmentID != nil || employees[0].DepartmentName != nil {
+		t.Fatalf("new employee should start without a department: %#v", employees)
+	}
+	updated, err := assignEmployeeDepartment(db, locationID, []int64{employees[0].ID}, &departmentID)
+	if err != nil {
+		t.Fatalf("assignEmployeeDepartment: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("expected one department assignment, got %d", updated)
+	}
+	employee, err := getEmployee(db, locationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.Job != "Team Member" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
+		t.Fatalf("department assignment changed job or did not load department: %#v", employee)
+	}
+}
+
 func TestImportBioPreservesRolesForRemainingEmployees(t *testing.T) {
 	data := birthdayWorkbook(t, [][]string{
 		{"Employee Name", "Employee Number", "Job", "Employee Status", "Location Latest Start Date"},
@@ -345,12 +390,18 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"Title":    "Location",
 				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
 				"Roles":    []Role{{ID: 1, Name: "Trainer"}},
+				"Departments": []Department{
+					{ID: 1, Name: "Front of House"},
+				},
+				"JobOptions": []string{"Team Member"},
 				"Employees": []Employee{{
 					EmployeeName:            "Blanco, John",
 					EmployeeNumber:          "12-1083836",
 					Job:                     "Team Member",
 					RoleID:                  int64Ptr(1),
 					RoleName:                stringPtr("Trainer"),
+					DepartmentID:            int64Ptr(1),
+					DepartmentName:          stringPtr("Front of House"),
 					EmployeeStatus:          "Active",
 					LocationLatestStartDate: "2024-10-01",
 					BirthDate:               stringPtr("1999-03-14"),
@@ -359,11 +410,37 @@ func TestAdminTemplatesRender(t *testing.T) {
 			},
 		},
 		{
+			name: "location documents",
+			body: locationDocumentsHTML,
+			data: map[string]any{
+				"Title":    "Documents",
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Import":   url.Values{"added": []string{"1"}, "updated": []string{"2"}, "removed": []string{"0"}, "skipped": []string{"0"}},
+			},
+		},
+		{
+			name: "location edit",
+			body: locationEditHTML,
+			data: map[string]any{
+				"Title":    "Edit",
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Saved":    "1",
+			},
+		},
+		{
 			name: "roles",
 			body: rolesHTML,
 			data: map[string]any{
 				"Title": "Roles",
 				"Roles": []Role{{ID: 1, Name: "Trainer", Employees: 2}},
+			},
+		},
+		{
+			name: "departments",
+			body: departmentsHTML,
+			data: map[string]any{
+				"Title":       "Departments",
+				"Departments": []Department{{ID: 1, Name: "Front of House", Employees: 2}},
 			},
 		},
 		{

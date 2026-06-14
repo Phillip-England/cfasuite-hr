@@ -1,8 +1,9 @@
 module github.com/phillip-england/cfasuite-hr
 
-go 1.24
+go 1.24.1
 
 require (
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/xuri/excelize/v2 v2.9.1
 	golang.org/x/crypto v0.38.0
 	modernc.org/sqlite v1.37.1

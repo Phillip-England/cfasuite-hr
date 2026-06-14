@@ -21,10 +21,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ledongthuc/pdf"
 	"github.com/xuri/excelize/v2"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
@@ -110,6 +113,55 @@ type BioEmployee struct {
 type BirthdayEmployee struct {
 	Name      string
 	BirthDate string
+}
+
+type TimePunchReport struct {
+	Title        string
+	LocationName string
+	PeriodLabel  string
+	StartDate    string
+	EndDate      string
+	Employees    []LaborEmployee
+	GrandTotals  LaborTotals
+}
+
+type LaborEmployee struct {
+	Name   string
+	Job    string
+	Days   []LaborDay
+	Totals LaborTotals
+}
+
+type LaborDay struct {
+	Weekday    string
+	Date       string
+	Minutes    int
+	WagesCents int64
+}
+
+type LaborTotals struct {
+	Minutes    int
+	WagesCents int64
+}
+
+type LaborSummary struct {
+	Label   string
+	Hours   string
+	Dollars string
+}
+
+type LaborEmployeeRow struct {
+	Name    string
+	Job     string
+	Hours   string
+	Dollars string
+}
+
+type LaborDayRow struct {
+	Day     string
+	Date    string
+	Hours   string
+	Dollars string
 }
 
 func main() {
@@ -442,6 +494,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
+	mux.HandleFunc("GET /labor", a.requireAdmin(a.laborPage))
+	mux.HandleFunc("POST /labor", a.requireAdmin(a.laborUpload))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
 	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
 	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
@@ -616,6 +670,64 @@ func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d?birthday_updated=%d&birthday_skipped=%d", id, result.Updated, result.Skipped), http.StatusSeeOther)
+}
+
+func (a *App) laborPage(w http.ResponseWriter, r *http.Request) {
+	locations, err := listLocations(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "Labor", laborHTML, map[string]any{"Locations": locations})
+}
+
+func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	locationID, err := strconv.ParseInt(r.FormValue("location_id"), 10, 64)
+	if err != nil || locationID == 0 {
+		http.Error(w, "location is required", http.StatusBadRequest)
+		return
+	}
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	file, header, err := r.FormFile("time_punch")
+	if err != nil {
+		http.Error(w, "time punch report PDF is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	report, err := parseTimePunchPDF(file, header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employees, err := listEmployees(a.db, locationID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	applyEmployeeJobs(&report, employees)
+	locations, err := listLocations(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "Labor", laborHTML, map[string]any{
+		"Locations":        locations,
+		"SelectedLocation": loc,
+		"Report":           report,
+		"Summary":          laborSummary(report),
+		"DayRows":          laborDayRows(report),
+		"EmployeeRows":     laborEmployeeRows(report),
+		"JobRows":          laborJobRows(report),
+	})
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -1070,6 +1182,345 @@ func parseBirthdays(data []byte) ([]BirthdayEmployee, error) {
 	return birthdays, nil
 }
 
+func parseTimePunchPDF(file multipart.File, header *multipart.FileHeader) (TimePunchReport, error) {
+	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".pdf") {
+		return TimePunchReport{}, errors.New("time punch report must be a PDF file")
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return TimePunchReport{}, err
+	}
+	reader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return TimePunchReport{}, fmt.Errorf("read PDF: %w", err)
+	}
+	var text bytes.Buffer
+	plain, err := reader.GetPlainText()
+	if err != nil {
+		return TimePunchReport{}, fmt.Errorf("extract PDF text: %w", err)
+	}
+	if _, err := io.Copy(&text, plain); err != nil {
+		return TimePunchReport{}, err
+	}
+	return parseTimePunchText(text.String())
+}
+
+func parseTimePunchText(text string) (TimePunchReport, error) {
+	report := TimePunchReport{Title: "Employee Time Detail"}
+	var current *LaborEmployee
+	expectLocation := false
+	for _, line := range cleanReportLines(text) {
+		switch {
+		case line == "Employee Time Detail":
+			report.Title = line
+			expectLocation = true
+			continue
+		case expectLocation && !strings.HasPrefix(line, "From "):
+			report.LocationName = line
+			expectLocation = false
+			continue
+		case strings.HasPrefix(line, "From "):
+			report.PeriodLabel = line
+			report.StartDate, report.EndDate = parseReportPeriod(line)
+			expectLocation = false
+			continue
+		}
+		expectLocation = false
+		if matches := employeeTotalsRe.FindStringSubmatch(line); matches != nil {
+			if current != nil {
+				current.Totals = LaborTotals{Minutes: parseDurationMinutes(matches[1]), WagesCents: lastMoneyCents(matches[2])}
+			}
+			continue
+		}
+		if matches := grandTotalsRe.FindStringSubmatch(line); matches != nil {
+			report.GrandTotals = LaborTotals{Minutes: parseDurationMinutes(matches[1]), WagesCents: lastMoneyCents(matches[2])}
+			continue
+		}
+		if ignoreTimePunchLine(line) {
+			continue
+		}
+		if employeeNameRe.MatchString(line) && strings.Contains(line, ",") {
+			report.Employees = append(report.Employees, LaborEmployee{Name: line})
+			current = &report.Employees[len(report.Employees)-1]
+			continue
+		}
+		matches := punchLineRe.FindStringSubmatch(line)
+		if matches == nil || current == nil {
+			continue
+		}
+		payType := strings.ToLower(matches[4])
+		minutes := 0
+		if payType == "regular" {
+			minutes = parseDurationMinutes(matches[3])
+		}
+		day := LaborDay{
+			Weekday:    titleWeekday(matches[1]),
+			Date:       normalizeUSDate(matches[2]),
+			Minutes:    minutes,
+			WagesCents: lastMoneyCents(matches[5]),
+		}
+		addLaborDay(current, day)
+	}
+	for i := range report.Employees {
+		if report.Employees[i].Totals.Minutes == 0 && report.Employees[i].Totals.WagesCents == 0 {
+			report.Employees[i].Totals = sumEmployeeDays(report.Employees[i])
+		}
+	}
+	if report.GrandTotals.Minutes == 0 && report.GrandTotals.WagesCents == 0 {
+		for _, employee := range report.Employees {
+			report.GrandTotals.Minutes += employee.Totals.Minutes
+			report.GrandTotals.WagesCents += employee.Totals.WagesCents
+		}
+	}
+	return report, nil
+}
+
+func cleanReportLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.ReplaceAll(line, "\f", " ")
+		cleaned := strings.Join(strings.Fields(line), " ")
+		if cleaned != "" {
+			lines = append(lines, cleaned)
+		}
+	}
+	return lines
+}
+
+func ignoreTimePunchLine(line string) bool {
+	return line == "Employee" ||
+		line == "Date" ||
+		line == "Name" ||
+		line == "Time In" ||
+		line == "Time Out" ||
+		line == "Total Time" ||
+		line == "Pay Type" ||
+		line == "Wage Rate" ||
+		line == "Regular Hours Wages Overtime Hours Wages Total Wages" ||
+		strings.HasPrefix(line, "Punch types of") ||
+		strings.HasPrefix(line, "* - clock-in time or clock-out time") ||
+		strings.Contains(line, "Page ") ||
+		footerTimestampRe.MatchString(line)
+}
+
+func addLaborDay(employee *LaborEmployee, day LaborDay) {
+	for i := range employee.Days {
+		if employee.Days[i].Date == day.Date {
+			employee.Days[i].Minutes += day.Minutes
+			employee.Days[i].WagesCents += day.WagesCents
+			return
+		}
+	}
+	employee.Days = append(employee.Days, day)
+	sort.Slice(employee.Days, func(i, j int) bool { return employee.Days[i].Date < employee.Days[j].Date })
+}
+
+func sumEmployeeDays(employee LaborEmployee) LaborTotals {
+	var totals LaborTotals
+	for _, day := range employee.Days {
+		totals.Minutes += day.Minutes
+		totals.WagesCents += day.WagesCents
+	}
+	return totals
+}
+
+func applyEmployeeJobs(report *TimePunchReport, employees []Employee) {
+	byName := map[string]string{}
+	for _, employee := range employees {
+		byName[normalizeName(employee.EmployeeName)] = employee.Job
+	}
+	for i := range report.Employees {
+		if job := byName[normalizeName(report.Employees[i].Name)]; job != "" {
+			report.Employees[i].Job = job
+		} else {
+			report.Employees[i].Job = "Unmatched"
+		}
+	}
+}
+
+func laborSummary(report TimePunchReport) []LaborSummary {
+	return []LaborSummary{
+		{Label: "Total week", Hours: formatHours(report.GrandTotals.Minutes), Dollars: formatDollars(report.GrandTotals.WagesCents)},
+		{Label: "Employees", Hours: strconv.Itoa(len(report.Employees)), Dollars: report.PeriodLabel},
+	}
+}
+
+func laborDayRows(report TimePunchReport) []LaborDayRow {
+	totals := map[string]LaborDay{}
+	for _, employee := range report.Employees {
+		for _, day := range employee.Days {
+			key := day.Date
+			total := totals[key]
+			if total.Date == "" {
+				total.Date = day.Date
+				total.Weekday = day.Weekday
+			}
+			total.Minutes += day.Minutes
+			total.WagesCents += day.WagesCents
+			totals[key] = total
+		}
+	}
+	keys := make([]string, 0, len(totals))
+	for key := range totals {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	rows := make([]LaborDayRow, 0, len(keys))
+	for _, key := range keys {
+		total := totals[key]
+		rows = append(rows, LaborDayRow{Day: total.Weekday, Date: total.Date, Hours: formatHours(total.Minutes), Dollars: formatDollars(total.WagesCents)})
+	}
+	return rows
+}
+
+func laborEmployeeRows(report TimePunchReport) []LaborEmployeeRow {
+	employees := append([]LaborEmployee(nil), report.Employees...)
+	sort.Slice(employees, func(i, j int) bool {
+		if employees[i].Totals.WagesCents == employees[j].Totals.WagesCents {
+			return employees[i].Name < employees[j].Name
+		}
+		return employees[i].Totals.WagesCents > employees[j].Totals.WagesCents
+	})
+	rows := make([]LaborEmployeeRow, 0, len(employees))
+	for _, employee := range employees {
+		rows = append(rows, LaborEmployeeRow{Name: employee.Name, Job: employee.Job, Hours: formatHours(employee.Totals.Minutes), Dollars: formatDollars(employee.Totals.WagesCents)})
+	}
+	return rows
+}
+
+func laborJobRows(report TimePunchReport) []LaborEmployeeRow {
+	type total struct {
+		minutes int
+		cents   int64
+	}
+	byJob := map[string]total{}
+	for _, employee := range report.Employees {
+		job := employee.Job
+		if job == "" {
+			job = "Unmatched"
+		}
+		current := byJob[job]
+		current.minutes += employee.Totals.Minutes
+		current.cents += employee.Totals.WagesCents
+		byJob[job] = current
+	}
+	type jobRow struct {
+		row   LaborEmployeeRow
+		cents int64
+	}
+	sortable := make([]jobRow, 0, len(byJob))
+	for job, total := range byJob {
+		sortable = append(sortable, jobRow{row: LaborEmployeeRow{Job: job, Hours: formatHours(total.minutes), Dollars: formatDollars(total.cents)}, cents: total.cents})
+	}
+	sort.Slice(sortable, func(i, j int) bool {
+		if sortable[i].cents == sortable[j].cents {
+			return sortable[i].row.Job < sortable[j].row.Job
+		}
+		return sortable[i].cents > sortable[j].cents
+	})
+	rows := make([]LaborEmployeeRow, 0, len(sortable))
+	for _, item := range sortable {
+		rows = append(rows, item.row)
+	}
+	return rows
+}
+
+func parseReportPeriod(line string) (string, string) {
+	matches := periodRe.FindStringSubmatch(line)
+	if matches == nil {
+		return "", ""
+	}
+	return formatLongDate(matches[1]), formatLongDate(matches[2])
+}
+
+func parseDurationMinutes(value string) int {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0
+	}
+	hours, _ := strconv.Atoi(parts[0])
+	minutes, _ := strconv.Atoi(parts[1])
+	return hours*60 + minutes
+}
+
+func lastMoneyCents(text string) int64 {
+	matches := moneyRe.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	return parseMoneyCents(matches[len(matches)-1])
+}
+
+func parseMoneyCents(value string) int64 {
+	normalized := strings.TrimPrefix(strings.ReplaceAll(value, ",", ""), "$")
+	parts := strings.SplitN(normalized, ".", 2)
+	dollars, _ := strconv.ParseInt(parts[0], 10, 64)
+	var cents int64
+	if len(parts) == 2 {
+		fraction := parts[1]
+		if len(fraction) > 2 {
+			fraction = fraction[:2]
+		}
+		for len(fraction) < 2 {
+			fraction += "0"
+		}
+		cents, _ = strconv.ParseInt(fraction, 10, 64)
+	}
+	return dollars*100 + cents
+}
+
+func normalizeUSDate(value string) string {
+	if t, err := time.Parse("01/02/2006", value); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return value
+}
+
+func formatLongDate(value string) string {
+	if t, err := time.Parse("Monday, January 2, 2006", value); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return value
+}
+
+func titleWeekday(value string) string {
+	switch strings.ToLower(value) {
+	case "mon":
+		return "Monday"
+	case "tue":
+		return "Tuesday"
+	case "wed":
+		return "Wednesday"
+	case "thu":
+		return "Thursday"
+	case "fri":
+		return "Friday"
+	case "sat":
+		return "Saturday"
+	case "sun":
+		return "Sunday"
+	default:
+		return value
+	}
+}
+
+func normalizeName(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(value)), " ")
+}
+
+func formatHours(minutes int) string {
+	return fmt.Sprintf("%.2f", float64(minutes)/60)
+}
+
+func formatDollars(cents int64) string {
+	sign := ""
+	if cents < 0 {
+		sign = "-"
+		cents = -cents
+	}
+	return fmt.Sprintf("%s$%d.%02d", sign, cents/100, cents%100)
+}
+
 func cell(row []string, idx int) string {
 	if idx < 0 || idx >= len(row) {
 		return ""
@@ -1399,6 +1850,16 @@ func urlText(s string) string {
 	return strings.ReplaceAll(s, " ", "+")
 }
 
+var (
+	punchLineRe       = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(\d{2}/\d{2}/\d{4})\s+\d{1,2}:\d{2}\s*[ap]\*?\s+\d{1,2}:\d{2}\s*[ap]\*?\s+(\d{1,4}:\d{2})\s+(Regular|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
+	employeeTotalsRe  = regexp.MustCompile(`^Employee Totals\s+(\d{1,4}:\d{2})(.*)$`)
+	grandTotalsRe     = regexp.MustCompile(`^All Employees Grand Total\s+(\d{1,4}:\d{2})(.*)$`)
+	periodRe          = regexp.MustCompile(`^From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+through\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})$`)
+	moneyRe           = regexp.MustCompile(`\$[\d,]+\.\d{2}`)
+	employeeNameRe    = regexp.MustCompile(`^[A-Za-z][A-Za-z ,.'()/-]+$`)
+	footerTimestampRe = regexp.MustCompile(`^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M`)
+)
+
 func env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -1442,6 +1903,7 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
     <a class="brand" href="/">cfasuite-hr</a>
     {{if not .LoggedOut}}<nav>
       <a href="/">Locations</a>
+      <a href="/labor">Labor</a>
       <a href="/tokens">API Tokens</a>
       <a href="/docs">API Docs</a>
       <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
@@ -1534,6 +1996,60 @@ const locationShowHTML = `{{define "body"}}
 </section>
 {{end}}`
 
+const laborHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>Labor</h1>
+    <p class="muted">Upload an Employee Time Detail PDF for one location.</p>
+  </div>
+</div>
+<form method="post" action="/labor" enctype="multipart/form-data" class="panel labor-upload">
+  <label>Location
+    <select name="location_id" required>
+      <option value="">Select location</option>
+      {{range .Locations}}<option value="{{.ID}}" {{if $.SelectedLocation}}{{if eq $.SelectedLocation.ID .ID}}selected{{end}}{{end}}>{{.Name}} - Store {{.Number}}</option>{{end}}
+    </select>
+  </label>
+  <label>Time punch report
+    <input type="file" name="time_punch" accept=".pdf" required>
+  </label>
+  <button>Analyze labor</button>
+</form>
+{{if .Report}}
+<section class="report-head">
+  <div>
+    <h2>{{.SelectedLocation.Name}}</h2>
+    <p class="muted">Store {{.SelectedLocation.Number}}{{if .Report.LocationName}} · Report location: {{.Report.LocationName}}{{end}}</p>
+    {{if .Report.PeriodLabel}}<p class="muted">{{.Report.PeriodLabel}}</p>{{end}}
+  </div>
+  <div class="summary-grid">
+    {{range .Summary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em></article>{{end}}
+  </div>
+</section>
+<section>
+  <h2>Labor by day</h2>
+  <table>
+    <thead><tr><th>Day</th><th>Date</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No day labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section>
+  <h2>Labor by job</h2>
+  <table>
+    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="3">No job labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section>
+  <h2>Labor by employee</h2>
+  <table>
+    <thead><tr><th>Employee</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody>{{range .EmployeeRows}}<tr><td>{{.Name}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No employee labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+{{end}}
+{{end}}`
+
 const tokensHTML = `{{define "body"}}
 <div class="row"><h1>API Tokens</h1></div>
 {{if .NewToken}}<section class="notice"><strong>{{.NewTokenName}}</strong><code>{{.NewToken}}</code><p>Copy this now. It will not be shown again.</p></section>{{end}}
@@ -1576,6 +2092,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
-@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline{display:block}.row>*{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr 1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.labor-upload,.report-head,.summary-grid{display:block}.row>*{margin-bottom:12px}.labor-upload label,.summary-grid .metric{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

@@ -368,6 +368,43 @@ Employee Totals 6:00 6:00 $84.00 $84.00
 	}
 }
 
+func TestLaborRowsUseEmployeeRoleAndDepartmentAssignments(t *testing.T) {
+	report, err := parseTimePunchText(`Employee Time Detail
+Store
+From Monday, May 11, 2026 through Saturday, May 16, 2026
+Baker, Ramond Manley (Ray)
+Mon, 05/11/2026 8:00a 1:00p 5:00 Regular $15.00 5:00 $75.00 $75.00
+Employee Totals 5:00 5:00 $75.00 $75.00
+Escobar, Angel
+Fri, 05/15/2026 9:00a 3:00p 6:00 Regular $14.00 6:00 $84.00 $84.00
+Employee Totals 6:00 6:00 $84.00 $84.00
+`)
+	if err != nil {
+		t.Fatalf("parseTimePunchText returned error: %v", err)
+	}
+	trainer := "Trainer"
+	foh := "Front of House"
+	kitchen := "Kitchen"
+	applyEmployeeAssignments(&report, []Employee{
+		{EmployeeName: "Baker, Ramond Manley (Ray)", Job: "Kitchen", RoleName: &trainer, DepartmentName: &kitchen},
+		{EmployeeName: "Escobar, Angel", Job: "Front Counter", RoleName: &trainer, DepartmentName: &foh},
+	})
+	roleRows := laborRoleRows(report)
+	if len(roleRows) != 1 {
+		t.Fatalf("expected 1 role row, got %#v", roleRows)
+	}
+	if roleRows[0].Role != "Trainer" || roleRows[0].Hours != "11.00" || roleRows[0].Dollars != "$159.00" || roleRows[0].Percent != "100.0%" {
+		t.Fatalf("unexpected role row: %#v", roleRows[0])
+	}
+	departmentRows := laborDepartmentRows(report)
+	if len(departmentRows) != 2 {
+		t.Fatalf("expected 2 department rows, got %#v", departmentRows)
+	}
+	if departmentRows[0].Department != "Front of House" || departmentRows[0].Hours != "6.00" || departmentRows[0].Dollars != "$84.00" || departmentRows[0].Percent != "52.8%" {
+		t.Fatalf("unexpected first department row: %#v", departmentRows[0])
+	}
+}
+
 func TestAdminTemplatesRender(t *testing.T) {
 	templates := []struct {
 		name string
@@ -452,7 +489,9 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"Report":           TimePunchReport{PeriodLabel: "From Monday, May 11, 2026 through Saturday, May 16, 2026"},
 				"Summary":          []LaborSummary{{Label: "Total week", Hours: "10.00", Dollars: "$100.00"}},
 				"DayRows":          []LaborDayRow{{Day: "Monday", Date: "2026-05-11", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
-				"EmployeeRows":     []LaborEmployeeRow{{Name: "Blanco, John", Job: "Team Member", Hours: "10.00", Dollars: "$100.00"}},
+				"RoleRows":         []LaborEmployeeRow{{Role: "Trainer", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
+				"DepartmentRows":   []LaborEmployeeRow{{Department: "Front of House", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
+				"EmployeeRows":     []LaborEmployeeRow{{Name: "Blanco, John", Job: "Team Member", Role: "Trainer", Department: "Front of House", Hours: "10.00", Dollars: "$100.00"}},
 				"EmployeeJobs":     []string{"Team Member"},
 				"JobRows":          []LaborEmployeeRow{{Job: "Team Member", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
 			},

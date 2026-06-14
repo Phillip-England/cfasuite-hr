@@ -146,10 +146,12 @@ type TimePunchReport struct {
 }
 
 type LaborEmployee struct {
-	Name   string
-	Job    string
-	Days   []LaborDay
-	Totals LaborTotals
+	Name       string
+	Job        string
+	Role       string
+	Department string
+	Days       []LaborDay
+	Totals     LaborTotals
 }
 
 type LaborDay struct {
@@ -173,6 +175,8 @@ type LaborSummary struct {
 type LaborEmployeeRow struct {
 	Name         string
 	Job          string
+	Role         string
+	Department   string
 	Hours        string
 	Dollars      string
 	Percent      string
@@ -940,12 +944,14 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyEmployeeJobs(&report, employees)
+	applyEmployeeAssignments(&report, employees)
 	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{
 		"SelectedLocation": loc,
 		"Report":           report,
 		"Summary":          laborSummary(report),
 		"DayRows":          laborDayRows(report),
+		"RoleRows":         laborRoleRows(report),
+		"DepartmentRows":   laborDepartmentRows(report),
 		"EmployeeRows":     laborEmployeeRows(report),
 		"EmployeeJobs":     laborEmployeeJobOptions(report),
 		"JobRows":          laborJobRows(report),
@@ -1851,18 +1857,45 @@ func sumEmployeeDays(employee LaborEmployee) LaborTotals {
 	return totals
 }
 
-func applyEmployeeJobs(report *TimePunchReport, employees []Employee) {
-	byName := map[string]string{}
+func applyEmployeeAssignments(report *TimePunchReport, employees []Employee) {
+	type assignment struct {
+		job        string
+		role       string
+		department string
+	}
+	byName := map[string]assignment{}
 	for _, employee := range employees {
-		byName[normalizeName(employee.EmployeeName)] = employee.Job
+		current := assignment{
+			job:        strings.TrimSpace(employee.Job),
+			role:       "Unassigned",
+			department: "Unassigned",
+		}
+		if employee.RoleName != nil && strings.TrimSpace(*employee.RoleName) != "" {
+			current.role = strings.TrimSpace(*employee.RoleName)
+		}
+		if employee.DepartmentName != nil && strings.TrimSpace(*employee.DepartmentName) != "" {
+			current.department = strings.TrimSpace(*employee.DepartmentName)
+		}
+		byName[normalizeName(employee.EmployeeName)] = current
 	}
 	for i := range report.Employees {
-		if job := byName[normalizeName(report.Employees[i].Name)]; job != "" {
-			report.Employees[i].Job = job
+		if assignment, ok := byName[normalizeName(report.Employees[i].Name)]; ok {
+			report.Employees[i].Job = assignment.job
+			if report.Employees[i].Job == "" {
+				report.Employees[i].Job = "Unmatched"
+			}
+			report.Employees[i].Role = assignment.role
+			report.Employees[i].Department = assignment.department
 		} else {
 			report.Employees[i].Job = "Unmatched"
+			report.Employees[i].Role = "Unmatched"
+			report.Employees[i].Department = "Unmatched"
 		}
 	}
+}
+
+func applyEmployeeJobs(report *TimePunchReport, employees []Employee) {
+	applyEmployeeAssignments(report, employees)
 }
 
 func laborSummary(report TimePunchReport) []LaborSummary {
@@ -1925,6 +1958,8 @@ func laborEmployeeRows(report TimePunchReport) []LaborEmployeeRow {
 		rows = append(rows, LaborEmployeeRow{
 			Name:         employee.Name,
 			Job:          employee.Job,
+			Role:         employee.Role,
+			Department:   employee.Department,
 			Hours:        formatHours(employee.Totals.Minutes),
 			Dollars:      formatDollars(employee.Totals.WagesCents),
 			MinutesValue: employee.Totals.Minutes,
@@ -1968,39 +2003,57 @@ func employeeJobOptions(employees []Employee) []string {
 }
 
 func laborJobRows(report TimePunchReport) []LaborEmployeeRow {
+	return laborGroupRows(report, "job")
+}
+
+func laborRoleRows(report TimePunchReport) []LaborEmployeeRow {
+	return laborGroupRows(report, "role")
+}
+
+func laborDepartmentRows(report TimePunchReport) []LaborEmployeeRow {
+	return laborGroupRows(report, "department")
+}
+
+func laborGroupRows(report TimePunchReport, group string) []LaborEmployeeRow {
 	type total struct {
 		minutes int
 		cents   int64
 	}
-	byJob := map[string]total{}
+	byGroup := map[string]total{}
 	for _, employee := range report.Employees {
-		job := employee.Job
-		if job == "" {
-			job = "Unmatched"
-		}
-		current := byJob[job]
+		key := laborGroupValue(employee, group)
+		current := byGroup[key]
 		current.minutes += employee.Totals.Minutes
 		current.cents += employee.Totals.WagesCents
-		byJob[job] = current
+		byGroup[key] = current
 	}
-	type jobRow struct {
+	type groupRow struct {
 		row   LaborEmployeeRow
 		cents int64
+		key   string
 	}
-	sortable := make([]jobRow, 0, len(byJob))
-	for job, total := range byJob {
-		sortable = append(sortable, jobRow{row: LaborEmployeeRow{
-			Job:          job,
+	sortable := make([]groupRow, 0, len(byGroup))
+	for key, total := range byGroup {
+		row := LaborEmployeeRow{
 			Hours:        formatHours(total.minutes),
 			Dollars:      formatDollars(total.cents),
 			Percent:      formatPercent(total.cents, report.GrandTotals.WagesCents),
 			MinutesValue: total.minutes,
 			CentsValue:   total.cents,
-		}, cents: total.cents})
+		}
+		switch group {
+		case "role":
+			row.Role = key
+		case "department":
+			row.Department = key
+		default:
+			row.Job = key
+		}
+		sortable = append(sortable, groupRow{row: row, cents: total.cents, key: key})
 	}
 	sort.Slice(sortable, func(i, j int) bool {
 		if sortable[i].cents == sortable[j].cents {
-			return sortable[i].row.Job < sortable[j].row.Job
+			return sortable[i].key < sortable[j].key
 		}
 		return sortable[i].cents > sortable[j].cents
 	})
@@ -2009,6 +2062,23 @@ func laborJobRows(report TimePunchReport) []LaborEmployeeRow {
 		rows = append(rows, item.row)
 	}
 	return rows
+}
+
+func laborGroupValue(employee LaborEmployee, group string) string {
+	var value string
+	switch group {
+	case "role":
+		value = employee.Role
+	case "department":
+		value = employee.Department
+	default:
+		value = employee.Job
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "Unmatched"
+	}
+	return value
 }
 
 func parseReportPeriod(line string) (string, string) {
@@ -2846,6 +2916,20 @@ const laborHTML = `{{define "body"}}
   </table>
 </section>
 <section>
+  <h2>Labor by role</h2>
+  <table>
+    <thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .RoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section>
+  <h2>Labor by department</h2>
+  <table>
+    <thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DepartmentRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section>
   <h2>Labor by job</h2>
   <table>
     <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
@@ -2878,8 +2962,8 @@ const laborHTML = `{{define "body"}}
     </div>
   </div>
   <table>
-    <thead><tr><th>Employee</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No employee labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Employee</th><th>Role</th><th>Department</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Role}}</td><td>{{.Department}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="6">No employee labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <script>

@@ -594,6 +594,40 @@ Employee Totals 0:00 0:00 $0.00 $0.00
 	}
 }
 
+func TestSalaryEmployeePunchedHoursArePreserved(t *testing.T) {
+	report, err := parseTimePunchText(`Employee Time Detail
+Store
+From Thursday, May 1, 2026 through Sunday, May 31, 2026
+Manager, Sally
+Mon, 05/04/2026 8:00a 1:00p 5:00 Regular $7,500.00 5:00 $0.00 $0.00
+Employee Totals 5:00 5:00 $0.00 $0.00
+`)
+	if err != nil {
+		t.Fatalf("parseTimePunchText returned error: %v", err)
+	}
+	applyEmployeeAssignments(&report, []Employee{{
+		EmployeeName:   "Manager, Sally",
+		EmployeeNumber: "99",
+		Job:            "Director",
+		WageRateCents:  int64Ptr(750000),
+		WagePayType:    "salary",
+	}})
+	finalizeLaborReport(&report, nil)
+	if len(report.Employees) != 1 {
+		t.Fatalf("expected salary employee to remain, got %#v", report.Employees)
+	}
+	if report.Employees[0].Totals.Minutes != 300 {
+		t.Fatalf("expected punched salary hours to remain, got %#v", report.Employees[0].Totals)
+	}
+	if report.Employees[0].Totals.WagesCents != 750000 {
+		t.Fatalf("expected salary labor dollars, got %s", formatDollars(report.Employees[0].Totals.WagesCents))
+	}
+	rows := laborEmployeeRows(report)
+	if len(rows) != 1 || rows[0].Hours != "5.00" || rows[0].Dollars != "$7500.00" {
+		t.Fatalf("expected salary employee row with hours and salary dollars, got %#v", rows)
+	}
+}
+
 func TestSalaryLaborUsesReportDayCount(t *testing.T) {
 	days := salaryLaborDays("2026-05-01", "2026-05-01", 750000)
 	total := sumEmployeeDays(LaborEmployee{Days: days})

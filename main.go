@@ -2253,9 +2253,27 @@ func applySalaryLabor(report *TimePunchReport) {
 		if employee.WagePayType != "salary" || employee.WageRateCents <= 0 {
 			continue
 		}
-		employee.Days = salaryLaborDays(report.StartDate, report.EndDate, employee.WageRateCents)
+		employee.Days = mergeSalaryLaborDays(employee.Days, salaryLaborDays(report.StartDate, report.EndDate, employee.WageRateCents))
 		employee.Totals = sumEmployeeDays(*employee)
 	}
+}
+
+func mergeSalaryLaborDays(punchedDays, salaryDays []LaborDay) []LaborDay {
+	byDate := map[string]int{}
+	merged := append([]LaborDay(nil), punchedDays...)
+	for i, day := range merged {
+		byDate[day.Date] = i
+	}
+	for _, salaryDay := range salaryDays {
+		if index, ok := byDate[salaryDay.Date]; ok {
+			merged[index].WagesCents = salaryDay.WagesCents
+			continue
+		}
+		byDate[salaryDay.Date] = len(merged)
+		merged = append(merged, salaryDay)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Date < merged[j].Date })
+	return merged
 }
 
 func filterExcludedLabor(report *TimePunchReport) {

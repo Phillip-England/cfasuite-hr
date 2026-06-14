@@ -430,7 +430,8 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"Departments": []Department{
 					{ID: 1, Name: "Front of House"},
 				},
-				"JobOptions": []string{"Team Member"},
+				"JobOptions":       []string{"Team Member"},
+				"AssignmentStatus": AssignmentStatus{},
 				"Employees": []Employee{{
 					EmployeeName:            "Blanco, John",
 					EmployeeNumber:          "12-1083836",

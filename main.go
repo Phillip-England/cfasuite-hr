@@ -80,11 +80,21 @@ type Employee struct {
 	EmployeeName            string    `json:"employee_name"`
 	EmployeeNumber          string    `json:"employee_number"`
 	Job                     string    `json:"job"`
+	RoleID                  *int64    `json:"role_id"`
+	RoleName                *string   `json:"role_name"`
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
 	BirthDate               *string   `json:"birth_date"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+type Role struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Employees int       `json:"employee_count,omitempty"`
 }
 
 type Token struct {
@@ -387,12 +397,19 @@ func migrate(db *sql.DB) error {
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS roles (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE TABLE IF NOT EXISTS employees (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
 			employee_name TEXT NOT NULL,
 			employee_number TEXT NOT NULL,
 			job TEXT NOT NULL,
+			role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
 			employee_status TEXT NOT NULL,
 			location_latest_start_date TEXT NOT NULL,
 			birth_date TEXT,
@@ -422,6 +439,9 @@ func migrate(db *sql.DB) error {
 		}
 	}
 	if err := ensureColumn(db, "employees", "birth_date", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "role_id", "INTEGER REFERENCES roles(id) ON DELETE SET NULL"); err != nil {
 		return err
 	}
 	return nil
@@ -498,8 +518,13 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
+	mux.HandleFunc("POST /locations/{id}/roles", a.requireAdmin(a.locationRolesUpdate))
 	mux.HandleFunc("GET /locations/{id}/labor", a.requireAdmin(a.laborPage))
 	mux.HandleFunc("POST /locations/{id}/labor", a.requireAdmin(a.laborUpload))
+	mux.HandleFunc("GET /roles", a.requireAdmin(a.rolesPage))
+	mux.HandleFunc("POST /roles", a.requireAdmin(a.roleCreate))
+	mux.HandleFunc("POST /roles/{id}", a.requireAdmin(a.roleUpdate))
+	mux.HandleFunc("POST /roles/{id}/delete", a.requireAdmin(a.roleDelete))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
 	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
 	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
@@ -589,7 +614,12 @@ func (a *App) locationShow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, loc.Name, locationShowHTML, map[string]any{"Location": loc, "Employees": employees, "Import": r.URL.Query()})
+	roles, err := listRoles(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name, locationShowHTML, map[string]any{"Location": loc, "Employees": employees, "Roles": roles, "Import": r.URL.Query()})
 }
 
 func (a *App) locationUpdate(w http.ResponseWriter, r *http.Request) {
@@ -676,6 +706,50 @@ func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d?birthday_updated=%d&birthday_skipped=%d", id, result.Updated, result.Skipped), http.StatusSeeOther)
 }
 
+func (a *App) locationRolesUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employeeIDs, err := parseInt64Values(r.Form["employee_id"])
+	if err != nil {
+		http.Error(w, "invalid employee selection", http.StatusBadRequest)
+		return
+	}
+	if len(employeeIDs) == 0 {
+		http.Redirect(w, r, fmt.Sprintf("/locations/%d?roles_assigned=0", id), http.StatusSeeOther)
+		return
+	}
+	var roleID *int64
+	if raw := strings.TrimSpace(r.FormValue("role_id")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid role", http.StatusBadRequest)
+			return
+		}
+		if _, err := getRole(a.db, parsed); err != nil {
+			http.Error(w, "role not found", http.StatusBadRequest)
+			return
+		}
+		roleID = &parsed
+	}
+	updated, err := assignEmployeeRole(a.db, id, employeeIDs, roleID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d?roles_assigned=%d", id, updated), http.StatusSeeOther)
+}
+
 func (a *App) laborPage(w http.ResponseWriter, r *http.Request) {
 	locationID, err := pathID(r, "id")
 	if err != nil {
@@ -732,6 +806,57 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		"EmployeeJobs":     laborEmployeeJobOptions(report),
 		"JobRows":          laborJobRows(report),
 	})
+}
+
+func (a *App) rolesPage(w http.ResponseWriter, r *http.Request) {
+	roles, err := listRoles(a.db)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, "Roles", rolesHTML, map[string]any{"Roles": roles})
+}
+
+func (a *App) roleCreate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := createRole(a.db, r.FormValue("name")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+}
+
+func (a *App) roleUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := updateRole(a.db, id, r.FormValue("name")); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+}
+
+func (a *App) roleDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := a.db.Exec(`DELETE FROM roles WHERE id = ?`, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/roles", http.StatusSeeOther)
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -960,9 +1085,89 @@ func getLocationByNumber(db *sql.DB, number string) (Location, error) {
 	return loc, err
 }
 
+func listRoles(db *sql.DB) ([]Role, error) {
+	rows, err := db.Query(`SELECT r.id, r.name, r.created_at, r.updated_at, COUNT(e.id)
+		FROM roles r
+		LEFT JOIN employees e ON e.role_id = r.id
+		GROUP BY r.id
+		ORDER BY r.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var roles []Role
+	for rows.Next() {
+		var role Role
+		var created, updated string
+		if err := rows.Scan(&role.ID, &role.Name, &created, &updated, &role.Employees); err != nil {
+			return nil, err
+		}
+		role.CreatedAt = parseTime(created)
+		role.UpdatedAt = parseTime(updated)
+		roles = append(roles, role)
+	}
+	return roles, rows.Err()
+}
+
+func createRole(db *sql.DB, name string) (int64, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, errors.New("role name is required")
+	}
+	res, err := db.Exec(`INSERT INTO roles (name) VALUES (?)`, name)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func updateRole(db *sql.DB, id int64, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("role name is required")
+	}
+	_, err := db.Exec(`UPDATE roles SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, name, id)
+	return err
+}
+
+func getRole(db *sql.DB, id int64) (Role, error) {
+	var role Role
+	var created, updated string
+	err := db.QueryRow(`SELECT id, name, created_at, updated_at FROM roles WHERE id = ?`, id).Scan(&role.ID, &role.Name, &created, &updated)
+	role.CreatedAt = parseTime(created)
+	role.UpdatedAt = parseTime(updated)
+	return role, err
+}
+
+func assignEmployeeRole(db *sql.DB, locationID int64, employeeIDs []int64, roleID *int64) (int, error) {
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	updated := 0
+	for _, employeeID := range employeeIDs {
+		var res sql.Result
+		if roleID == nil {
+			res, err = tx.Exec(`UPDATE employees SET role_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, employeeID)
+		} else {
+			res, err = tx.Exec(`UPDATE employees SET role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, *roleID, locationID, employeeID)
+		}
+		if err != nil {
+			return 0, err
+		}
+		affected, _ := res.RowsAffected()
+		updated += int(affected)
+	}
+	return updated, tx.Commit()
+}
+
 func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, birth_date, created_at, updated_at
-		FROM employees WHERE location_id = ? ORDER BY employee_name`, locationID)
+	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+		FROM employees e
+		LEFT JOIN roles r ON r.id = e.role_id
+		WHERE e.location_id = ?
+		ORDER BY e.employee_name`, locationID)
 	if err != nil {
 		return nil, err
 	}
@@ -979,8 +1184,10 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT id, location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, birth_date, created_at, updated_at
-		FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, number)
+	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+		FROM employees e
+		LEFT JOIN roles r ON r.id = e.role_id
+		WHERE e.location_id = ? AND e.employee_number = ?`, locationID, number)
 	return scanEmployee(row)
 }
 
@@ -992,7 +1199,15 @@ func scanEmployee(row scanner) (Employee, error) {
 	var e Employee
 	var created, updated string
 	var birthDate sql.NullString
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
+	var roleID sql.NullInt64
+	var roleName sql.NullString
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
+	if roleID.Valid {
+		e.RoleID = &roleID.Int64
+	}
+	if roleName.Valid {
+		e.RoleName = &roleName.String
+	}
 	if birthDate.Valid {
 		e.BirthDate = &birthDate.String
 	}
@@ -1769,6 +1984,7 @@ Base URL: %s
 Purpose:
 cfasuite-hr exposes Chick-fil-A restaurant locations and active employee records to other systems.
 Employee records come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files.
+Jobs come from the employee bio. Roles are configured inside cfasuite-hr by the admin and assigned manually.
 
 Authentication:
 Send an API token with either header:
@@ -1783,6 +1999,7 @@ Important data rules:
 - Store/location numbers are strings. Preserve leading zeroes such as "03394".
 - Employee numbers are strings.
 - Employees are active employees from the latest employee bio import.
+- job is the imported Chick-fil-A job field. role_id and role_name are internal cfasuite-hr role assignments and may be null.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
 - Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
 
@@ -1819,6 +2036,8 @@ Example response:
       "employee_name": "Blanco, John",
       "employee_number": "12-1083836",
       "job": "Team Member",
+      "role_id": 2,
+      "role_name": "Trainer",
       "employee_status": "Active",
       "location_latest_start_date": "2024-10-01",
       "birth_date": "1999-03-14",
@@ -1858,6 +2077,8 @@ type Employee struct {
 	EmployeeName            string `+"`json:\"employee_name\"`"+`
 	EmployeeNumber          string `+"`json:\"employee_number\"`"+`
 	Job                     string `+"`json:\"job\"`"+`
+	RoleID                  *int64 `+"`json:\"role_id\"`"+`
+	RoleName                *string `+"`json:\"role_name\"`"+`
 	EmployeeStatus          string `+"`json:\"employee_status\"`"+`
 	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
 	BirthDate               *string `+"`json:\"birth_date\"`"+`
@@ -1916,6 +2137,22 @@ func css(w http.ResponseWriter, r *http.Request) {
 
 func pathID(r *http.Request, name string) (int64, error) {
 	return strconv.ParseInt(r.PathValue(name), 10, 64)
+}
+
+func parseInt64Values(values []string) ([]int64, error) {
+	ids := make([]int64, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func randomToken(n int) string {
@@ -2022,6 +2259,7 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
     <a class="brand" href="/">cfasuite-hr</a>
     {{if not .LoggedOut}}<nav>
       <a href="/">Locations</a>
+      <a href="/roles">Roles</a>
       <a href="/tokens">API Tokens</a>
       <a href="/docs">API Docs</a>
       <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
@@ -2108,13 +2346,34 @@ const locationShowHTML = `{{define "body"}}
 </section>
 <section>
   <h2>Employees</h2>
+  {{if .Import.Get "roles_assigned"}}<p class="notice">Updated roles for {{.Import.Get "roles_assigned"}} employees.</p>{{end}}
+  <form method="post" action="/locations/{{.Location.ID}}/roles">
+  <div class="bulk-actions">
+    <label>Role
+      <select name="role_id">
+        <option value="">Unassigned</option>
+        {{range .Roles}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+      </select>
+    </label>
+    <button>Apply to selected</button>
+    <a class="button secondary" href="/roles">Manage roles</a>
+  </div>
   <table>
-    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Status</th><th>Latest start</th><th>Birthday</th></tr></thead>
+    <thead><tr><th class="check"><input type="checkbox" id="check-all-employees" aria-label="Select all employees"></th><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Latest start</th><th>Birthday</th></tr></thead>
     <tbody>
-    {{range .Employees}}<tr><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{.EmployeeStatus}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}<tr><td class="check"><input type="checkbox" name="employee_id" value="{{.ID}}" aria-label="Select {{.EmployeeName}}"></td><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{if .RoleName}}{{.RoleName}}{{else}}<span class="muted">Unassigned</span>{{end}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="7">No employees imported.</td></tr>{{end}}
     </tbody>
   </table>
+  </form>
 </section>
+<script>
+(() => {
+  const all = document.getElementById('check-all-employees');
+  if (!all) return;
+  const boxes = Array.from(document.querySelectorAll('input[name="employee_id"]'));
+  all.addEventListener('change', () => boxes.forEach(box => { box.checked = all.checked; }));
+})();
+</script>
 {{end}}`
 
 const laborHTML = `{{define "body"}}
@@ -2227,6 +2486,34 @@ const laborHTML = `{{define "body"}}
 {{end}}
 {{end}}`
 
+const rolesHTML = `{{define "body"}}
+<div class="row"><h1>Roles</h1></div>
+<form method="post" action="/roles" class="panel inline">
+  <label>Role name <input name="name" placeholder="Team Leader" required></label>
+  <button>Create role</button>
+</form>
+<table>
+  <thead><tr><th>Name</th><th>Assigned employees</th><th></th></tr></thead>
+  <tbody>
+  {{range .Roles}}
+    <tr>
+      <td>
+        <form method="post" action="/roles/{{.ID}}" class="inline table-form">
+          <label class="sr-only">Role name</label>
+          <input name="name" value="{{.Name}}" required>
+          <button class="small secondary">Save</button>
+        </form>
+      </td>
+      <td>{{.Employees}}</td>
+      <td><form method="post" action="/roles/{{.ID}}/delete" onsubmit="return confirm('Delete this role and clear it from assigned employees?')"><button class="danger small">Delete</button></form></td>
+    </tr>
+  {{else}}
+    <tr><td colspan="3">No roles created.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}`
+
 const tokensHTML = `{{define "body"}}
 <div class="row"><h1>API Tokens</h1></div>
 {{if .NewToken}}<section class="notice"><strong>{{.NewTokenName}}</strong><code>{{.NewToken}}</code><p>Copy this now. It will not be shown again.</p></section>{{end}}
@@ -2252,10 +2539,14 @@ const docsHTML = `{{define "body"}}
     <thead><tr><th>Method</th><th>URL</th><th>Returns</th></tr></thead>
     <tbody>
       <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations</code></td><td>Locations with store numbers and employee counts.</td></tr>
-      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></td><td>Active employees for one store, including <code>birth_date</code> when known.</td></tr>
+      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></td><td>Active employees for one store, including assigned <code>role_id</code>, <code>role_name</code>, and <code>birth_date</code> when known.</td></tr>
       <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees/{employeeNumber}</code></td><td>One active employee by employee number.</td></tr>
     </tbody>
   </table>
+</section>
+<section class="panel">
+  <h2>Employee roles</h2>
+  <p>Roles are created by the admin in cfasuite-hr and assigned manually to employees. The imported <code>job</code> field remains separate from <code>role_id</code> and <code>role_name</code>. Employees without an assigned role return <code>null</code> for both role fields.</p>
 </section>
 <section class="panel">
   <h2>Employee birthdays</h2>
@@ -2269,6 +2560,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head h2{margin:0}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
-@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.check{width:44px;text-align:center}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head h2{margin:0}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

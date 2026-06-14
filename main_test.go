@@ -67,6 +67,93 @@ func TestImportBioSyncsEmployees(t *testing.T) {
 	}
 }
 
+func TestEmployeeRolesAreAssignedSeparatelyFromJobs(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	roleID, err := createRole(db, "Trainer")
+	if err != nil {
+		t.Fatalf("createRole: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employees, err := listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	if len(employees) != 1 || employees[0].RoleID != nil || employees[0].RoleName != nil {
+		t.Fatalf("new employee should start without a role: %#v", employees)
+	}
+	updated, err := assignEmployeeRole(db, locationID, []int64{employees[0].ID}, &roleID)
+	if err != nil {
+		t.Fatalf("assignEmployeeRole: %v", err)
+	}
+	if updated != 1 {
+		t.Fatalf("expected one role assignment, got %d", updated)
+	}
+	employee, err := getEmployee(db, locationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.Job != "Team Member" || employee.RoleName == nil || *employee.RoleName != "Trainer" {
+		t.Fatalf("role assignment changed job or did not load role: %#v", employee)
+	}
+}
+
+func TestImportBioPreservesRolesForRemainingEmployees(t *testing.T) {
+	data := birthdayWorkbook(t, [][]string{
+		{"Employee Name", "Employee Number", "Job", "Employee Status", "Location Latest Start Date"},
+		{"Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01"},
+	})
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	roleID, err := createRole(db, "Trainer")
+	if err != nil {
+		t.Fatalf("createRole: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", roleID, "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	result, err := importBio(db, locationID, multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "bio.xlsx"})
+	if err != nil {
+		t.Fatalf("importBio: %v", err)
+	}
+	if result.Updated != 1 {
+		t.Fatalf("expected one employee update, got %#v", result)
+	}
+	employee, err := getEmployee(db, locationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.RoleName == nil || *employee.RoleName != "Trainer" {
+		t.Fatalf("role was not preserved across bio sync: %#v", employee)
+	}
+}
+
 func TestParseBirthdays(t *testing.T) {
 	data := birthdayWorkbook(t, [][]string{
 		{"Employee Name", "Birth Date"},
@@ -257,15 +344,26 @@ func TestAdminTemplatesRender(t *testing.T) {
 			data: map[string]any{
 				"Title":    "Location",
 				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Roles":    []Role{{ID: 1, Name: "Trainer"}},
 				"Employees": []Employee{{
 					EmployeeName:            "Blanco, John",
 					EmployeeNumber:          "12-1083836",
 					Job:                     "Team Member",
+					RoleID:                  int64Ptr(1),
+					RoleName:                stringPtr("Trainer"),
 					EmployeeStatus:          "Active",
 					LocationLatestStartDate: "2024-10-01",
 					BirthDate:               stringPtr("1999-03-14"),
 				}},
 				"Import": url.Values{},
+			},
+		},
+		{
+			name: "roles",
+			body: rolesHTML,
+			data: map[string]any{
+				"Title": "Roles",
+				"Roles": []Role{{ID: 1, Name: "Trainer", Employees: 2}},
 			},
 		},
 		{
@@ -341,5 +439,9 @@ func birthdayWorkbook(t *testing.T, rows [][]string) []byte {
 }
 
 func stringPtr(value string) *string {
+	return &value
+}
+
+func int64Ptr(value int64) *int64 {
 	return &value
 }

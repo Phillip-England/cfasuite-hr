@@ -67,6 +67,12 @@ Create a location in the admin UI, then upload the employee bio `.xlsx` for that
 
 Rows with `Employee Status` equal to `Terminated` are skipped. Existing employees missing from the new active set are removed for that location.
 
+## Roles
+
+Admins create available employee roles globally in the admin UI. Roles are separate from the imported `Job` field: `Job` comes from the employee bio, while `role_id` and `role_name` are cfasuite-hr assignments.
+
+New employees imported from an employee bio have no role until the admin assigns one. Open a location to bulk-select employees and apply a role, or clear their role by applying `Unassigned`. If an employee is removed by a later bio sync, that employee's role assignment is removed with the employee row.
+
 ## Birthday Report Imports
 
 Open a location in the admin UI, then upload the Employee Birthday Reader `.xlsx` report for that location. The report must contain:
@@ -100,6 +106,7 @@ Employee responses include:
 - `employee_name`
 - `employee_number`
 - `job`
+- `role_id` and `role_name` as assigned by cfasuite-hr, or `null`
 - `employee_status`
 - `location_latest_start_date`
 - `birth_date` as `YYYY-MM-DD` or `null`

@@ -151,10 +151,13 @@ type LaborSummary struct {
 }
 
 type LaborEmployeeRow struct {
-	Name    string
-	Job     string
-	Hours   string
-	Dollars string
+	Name         string
+	Job          string
+	Hours        string
+	Dollars      string
+	Percent      string
+	MinutesValue int
+	CentsValue   int64
 }
 
 type LaborDayRow struct {
@@ -162,6 +165,7 @@ type LaborDayRow struct {
 	Date    string
 	Hours   string
 	Dollars string
+	Percent string
 }
 
 func main() {
@@ -725,6 +729,7 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		"Summary":          laborSummary(report),
 		"DayRows":          laborDayRows(report),
 		"EmployeeRows":     laborEmployeeRows(report),
+		"EmployeeJobs":     laborEmployeeJobOptions(report),
 		"JobRows":          laborJobRows(report),
 	})
 }
@@ -1364,13 +1369,19 @@ func laborSummary(report TimePunchReport) []LaborSummary {
 
 func laborDayRows(report TimePunchReport) []LaborDayRow {
 	totals := map[string]LaborDay{}
+	dates := map[string]map[string]bool{}
 	for _, employee := range report.Employees {
 		for _, day := range employee.Days {
-			key := day.Date
+			key := day.Weekday
 			total := totals[key]
-			if total.Date == "" {
-				total.Date = day.Date
+			if total.Weekday == "" {
 				total.Weekday = day.Weekday
+			}
+			if dates[key] == nil {
+				dates[key] = map[string]bool{}
+			}
+			if day.Date != "" {
+				dates[key][day.Date] = true
 			}
 			total.Minutes += day.Minutes
 			total.WagesCents += day.WagesCents
@@ -1381,11 +1392,17 @@ func laborDayRows(report TimePunchReport) []LaborDayRow {
 	for key := range totals {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool { return weekdayIndex(keys[i]) < weekdayIndex(keys[j]) })
 	rows := make([]LaborDayRow, 0, len(keys))
 	for _, key := range keys {
 		total := totals[key]
-		rows = append(rows, LaborDayRow{Day: total.Weekday, Date: total.Date, Hours: formatHours(total.Minutes), Dollars: formatDollars(total.WagesCents)})
+		rows = append(rows, LaborDayRow{
+			Day:     total.Weekday,
+			Date:    formatDateList(dates[key]),
+			Hours:   formatHours(total.Minutes),
+			Dollars: formatDollars(total.WagesCents),
+			Percent: formatPercent(total.WagesCents, report.GrandTotals.WagesCents),
+		})
 	}
 	return rows
 }
@@ -1393,16 +1410,40 @@ func laborDayRows(report TimePunchReport) []LaborDayRow {
 func laborEmployeeRows(report TimePunchReport) []LaborEmployeeRow {
 	employees := append([]LaborEmployee(nil), report.Employees...)
 	sort.Slice(employees, func(i, j int) bool {
-		if employees[i].Totals.WagesCents == employees[j].Totals.WagesCents {
+		if employees[i].Totals.Minutes == employees[j].Totals.Minutes {
 			return employees[i].Name < employees[j].Name
 		}
-		return employees[i].Totals.WagesCents > employees[j].Totals.WagesCents
+		return employees[i].Totals.Minutes > employees[j].Totals.Minutes
 	})
 	rows := make([]LaborEmployeeRow, 0, len(employees))
 	for _, employee := range employees {
-		rows = append(rows, LaborEmployeeRow{Name: employee.Name, Job: employee.Job, Hours: formatHours(employee.Totals.Minutes), Dollars: formatDollars(employee.Totals.WagesCents)})
+		rows = append(rows, LaborEmployeeRow{
+			Name:         employee.Name,
+			Job:          employee.Job,
+			Hours:        formatHours(employee.Totals.Minutes),
+			Dollars:      formatDollars(employee.Totals.WagesCents),
+			MinutesValue: employee.Totals.Minutes,
+			CentsValue:   employee.Totals.WagesCents,
+		})
 	}
 	return rows
+}
+
+func laborEmployeeJobOptions(report TimePunchReport) []string {
+	seen := map[string]bool{}
+	for _, employee := range report.Employees {
+		job := employee.Job
+		if job == "" {
+			job = "Unmatched"
+		}
+		seen[job] = true
+	}
+	jobs := make([]string, 0, len(seen))
+	for job := range seen {
+		jobs = append(jobs, job)
+	}
+	sort.Strings(jobs)
+	return jobs
 }
 
 func laborJobRows(report TimePunchReport) []LaborEmployeeRow {
@@ -1427,7 +1468,14 @@ func laborJobRows(report TimePunchReport) []LaborEmployeeRow {
 	}
 	sortable := make([]jobRow, 0, len(byJob))
 	for job, total := range byJob {
-		sortable = append(sortable, jobRow{row: LaborEmployeeRow{Job: job, Hours: formatHours(total.minutes), Dollars: formatDollars(total.cents)}, cents: total.cents})
+		sortable = append(sortable, jobRow{row: LaborEmployeeRow{
+			Job:          job,
+			Hours:        formatHours(total.minutes),
+			Dollars:      formatDollars(total.cents),
+			Percent:      formatPercent(total.cents, report.GrandTotals.WagesCents),
+			MinutesValue: total.minutes,
+			CentsValue:   total.cents,
+		}, cents: total.cents})
 	}
 	sort.Slice(sortable, func(i, j int) bool {
 		if sortable[i].cents == sortable[j].cents {
@@ -1539,6 +1587,13 @@ func formatHours(minutes int) string {
 	return fmt.Sprintf("%.2f", float64(minutes)/60)
 }
 
+func formatPercent(part, total int64) string {
+	if total == 0 {
+		return "0.0%"
+	}
+	return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
+}
+
 func formatDollars(cents int64) string {
 	sign := ""
 	if cents < 0 {
@@ -1546,6 +1601,36 @@ func formatDollars(cents int64) string {
 		cents = -cents
 	}
 	return fmt.Sprintf("%s$%d.%02d", sign, cents/100, cents%100)
+}
+
+func weekdayIndex(weekday string) int {
+	switch weekday {
+	case "Sunday":
+		return 0
+	case "Monday":
+		return 1
+	case "Tuesday":
+		return 2
+	case "Wednesday":
+		return 3
+	case "Thursday":
+		return 4
+	case "Friday":
+		return 5
+	case "Saturday":
+		return 6
+	default:
+		return 7
+	}
+}
+
+func formatDateList(values map[string]bool) string {
+	dates := make([]string, 0, len(values))
+	for value := range values {
+		dates = append(dates, value)
+	}
+	sort.Strings(dates)
+	return strings.Join(dates, ", ")
 }
 
 func cell(row []string, idx int) string {
@@ -2058,26 +2143,87 @@ const laborHTML = `{{define "body"}}
   </div>
 </section>
 <section>
-  <h2>Labor by day</h2>
+  <h2>Labor by day of week</h2>
   <table>
-    <thead><tr><th>Day</th><th>Date</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No day labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No day labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by job</h2>
   <table>
-    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="3">No job labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
-<section>
-  <h2>Labor by employee</h2>
+<section id="employee-labor">
+  <div class="section-head">
+    <h2>Labor by employee</h2>
+    <div class="labor-controls">
+      <label>Name
+        <input id="employee-search" type="search" placeholder="Filter by name">
+      </label>
+      <label>Job
+        <select id="employee-job-filter">
+          <option value="">All jobs</option>
+          {{range .EmployeeJobs}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </label>
+      <label>Sort
+        <select id="employee-sort">
+          <option value="hours_desc">Hours high to low</option>
+          <option value="hours_asc">Hours low to high</option>
+          <option value="name_asc">Name A-Z</option>
+          <option value="name_desc">Name Z-A</option>
+          <option value="job_asc">Job A-Z</option>
+          <option value="dollars_desc">Labor dollars high to low</option>
+        </select>
+      </label>
+    </div>
+  </div>
   <table>
     <thead><tr><th>Employee</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody>{{range .EmployeeRows}}<tr><td>{{.Name}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No employee labor found.</td></tr>{{end}}</tbody>
+    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No employee labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
+<script>
+(() => {
+  const tbody = document.getElementById('employee-labor-rows');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr[data-name]'));
+  const search = document.getElementById('employee-search');
+  const jobFilter = document.getElementById('employee-job-filter');
+  const sort = document.getElementById('employee-sort');
+  const text = (row, key) => (row.dataset[key] || '').toLowerCase();
+  const number = (row, key) => Number(row.dataset[key] || 0);
+  function compareRows(a, b) {
+    switch (sort.value) {
+    case 'hours_asc':
+      return number(a, 'minutes') - number(b, 'minutes') || text(a, 'name').localeCompare(text(b, 'name'));
+    case 'name_asc':
+      return text(a, 'name').localeCompare(text(b, 'name'));
+    case 'name_desc':
+      return text(b, 'name').localeCompare(text(a, 'name'));
+    case 'job_asc':
+      return text(a, 'job').localeCompare(text(b, 'job')) || text(a, 'name').localeCompare(text(b, 'name'));
+    case 'dollars_desc':
+      return number(b, 'cents') - number(a, 'cents') || text(a, 'name').localeCompare(text(b, 'name'));
+    default:
+      return number(b, 'minutes') - number(a, 'minutes') || text(a, 'name').localeCompare(text(b, 'name'));
+    }
+  }
+  function applyEmployeeControls() {
+    const query = (search.value || '').trim().toLowerCase();
+    const job = jobFilter.value;
+    rows.sort(compareRows).forEach(row => {
+      row.hidden = Boolean(query && !text(row, 'name').includes(query)) || Boolean(job && row.dataset.job !== job);
+      tbody.appendChild(row);
+    });
+  }
+  [search, jobFilter, sort].forEach(control => control.addEventListener('input', applyEmployeeControls));
+  applyEmployeeControls();
+})();
+</script>
 {{end}}
 {{end}}`
 
@@ -2123,6 +2269,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
-@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.labor-upload,.report-head,.summary-grid{display:block}.row>*{margin-bottom:12px}.labor-upload label,.summary-grid .metric{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head h2{margin:0}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

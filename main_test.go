@@ -146,34 +146,35 @@ func TestImportBirthdaysUpdatesMatchingEmployeesForLocation(t *testing.T) {
 func TestParseTimePunchTextBuildsLaborRollups(t *testing.T) {
 	report, err := parseTimePunchText(`Employee Time Detail
 13th & Utica FSU
-From Monday, May 11, 2026 through Saturday, May 16, 2026
+From Monday, May 11, 2026 through Monday, May 18, 2026
 Baker, Ramond Manley (Ray)
 Mon, 05/11/2026 8:00a 1:00p 5:00 Regular $15.00 5:00 $75.00 $75.00
 Mon, 05/11/2026 1:00p 1:30p 0:30 Unpaid
 Tue, 05/12/2026 8:00a 2:30p 6:30 Regular $15.00 6:30 $97.50 $97.50
-Employee Totals 11:30 11:30 $172.50 $172.50
+Mon, 05/18/2026 8:00a 10:00a 2:00 Regular $15.00 2:00 $30.00 $30.00
+Employee Totals 13:30 13:30 $202.50 $202.50
 Escobar, Angel
 Fri, 05/15/2026 9:00a 3:00p 6:00 Regular $14.00 6:00 $84.00 $84.00
 Employee Totals 6:00 6:00 $84.00 $84.00
-All Employees Grand Total 17:30 17:30 $256.50 $256.50
+All Employees Grand Total 19:30 19:30 $286.50 $286.50
 `)
 	if err != nil {
 		t.Fatalf("parseTimePunchText returned error: %v", err)
 	}
-	if report.LocationName != "13th & Utica FSU" || report.StartDate != "2026-05-11" || report.EndDate != "2026-05-16" {
+	if report.LocationName != "13th & Utica FSU" || report.StartDate != "2026-05-11" || report.EndDate != "2026-05-18" {
 		t.Fatalf("unexpected metadata: %#v", report)
 	}
 	if len(report.Employees) != 2 {
 		t.Fatalf("expected 2 employees, got %d", len(report.Employees))
 	}
-	if report.GrandTotals.Minutes != 1050 || report.GrandTotals.WagesCents != 25650 {
+	if report.GrandTotals.Minutes != 1170 || report.GrandTotals.WagesCents != 28650 {
 		t.Fatalf("unexpected grand totals: %#v", report.GrandTotals)
 	}
 	dayRows := laborDayRows(report)
 	if len(dayRows) != 3 {
 		t.Fatalf("expected 3 day rows, got %#v", dayRows)
 	}
-	if dayRows[0].Day != "Monday" || dayRows[0].Hours != "5.00" || dayRows[0].Dollars != "$75.00" {
+	if dayRows[0].Day != "Monday" || dayRows[0].Date != "2026-05-11, 2026-05-18" || dayRows[0].Hours != "7.00" || dayRows[0].Dollars != "$105.00" || dayRows[0].Percent != "36.6%" {
 		t.Fatalf("unexpected Monday rollup: %#v", dayRows[0])
 	}
 }
@@ -200,10 +201,10 @@ func TestParseTimePunchPDFSample(t *testing.T) {
 		t.Fatalf("unexpected grand totals: %#v", report.GrandTotals)
 	}
 	dayRows := laborDayRows(report)
-	if len(dayRows) != 8 {
-		t.Fatalf("expected 8 day rows, got %#v", dayRows)
+	if len(dayRows) != 7 {
+		t.Fatalf("expected 7 weekday rows, got %#v", dayRows)
 	}
-	if dayRows[0].Date != "2026-06-07" || dayRows[0].Hours == "0.00" || dayRows[0].Dollars == "$0.00" {
+	if dayRows[0].Day != "Sunday" || dayRows[0].Date != "2026-06-07, 2026-06-14" || dayRows[0].Hours == "0.00" || dayRows[0].Dollars == "$0.00" || dayRows[0].Percent == "0.0%" {
 		t.Fatalf("unexpected first day row: %#v", dayRows[0])
 	}
 }
@@ -230,7 +231,7 @@ Employee Totals 6:00 6:00 $84.00 $84.00
 	if len(rows) != 2 {
 		t.Fatalf("expected 2 job rows, got %#v", rows)
 	}
-	if rows[0].Job != "Front Counter" || rows[0].Hours != "6.00" || rows[0].Dollars != "$84.00" {
+	if rows[0].Job != "Front Counter" || rows[0].Hours != "6.00" || rows[0].Dollars != "$84.00" || rows[0].Percent != "52.8%" {
 		t.Fatalf("unexpected first job row: %#v", rows[0])
 	}
 }
@@ -275,9 +276,10 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"SelectedLocation": Location{ID: 1, Name: "Southroads", Number: "03394"},
 				"Report":           TimePunchReport{PeriodLabel: "From Monday, May 11, 2026 through Saturday, May 16, 2026"},
 				"Summary":          []LaborSummary{{Label: "Total week", Hours: "10.00", Dollars: "$100.00"}},
-				"DayRows":          []LaborDayRow{{Day: "Monday", Date: "2026-05-11", Hours: "10.00", Dollars: "$100.00"}},
+				"DayRows":          []LaborDayRow{{Day: "Monday", Date: "2026-05-11", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
 				"EmployeeRows":     []LaborEmployeeRow{{Name: "Blanco, John", Job: "Team Member", Hours: "10.00", Dollars: "$100.00"}},
-				"JobRows":          []LaborEmployeeRow{{Job: "Team Member", Hours: "10.00", Dollars: "$100.00"}},
+				"EmployeeJobs":     []string{"Team Member"},
+				"JobRows":          []LaborEmployeeRow{{Job: "Team Member", Hours: "10.00", Dollars: "$100.00", Percent: "100.0%"}},
 			},
 		},
 		{

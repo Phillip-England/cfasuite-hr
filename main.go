@@ -806,6 +806,10 @@ func (a *App) updateEmployeeRoleAssignments(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if len(employeeIDs) == 0 {
+		if wantsAsync(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		http.Redirect(w, r, fmt.Sprintf("/locations/%d?roles_assigned=0", id), http.StatusSeeOther)
 		return
 	}
@@ -825,6 +829,10 @@ func (a *App) updateEmployeeRoleAssignments(w http.ResponseWriter, r *http.Reque
 	updated, err := assignEmployeeRole(a.db, id, employeeIDs, roleID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if wantsAsync(r) {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d?roles_assigned=%d", id, updated), http.StatusSeeOther)
@@ -850,6 +858,10 @@ func (a *App) updateEmployeeDepartmentAssignments(w http.ResponseWriter, r *http
 		return
 	}
 	if len(employeeIDs) == 0 {
+		if wantsAsync(r) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		http.Redirect(w, r, fmt.Sprintf("/locations/%d?departments_assigned=0", id), http.StatusSeeOther)
 		return
 	}
@@ -871,7 +883,15 @@ func (a *App) updateEmployeeDepartmentAssignments(w http.ResponseWriter, r *http
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if wantsAsync(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d?departments_assigned=%d", id, updated), http.StatusSeeOther)
+}
+
+func wantsAsync(r *http.Request) bool {
+	return r.Header.Get("X-Requested-With") == "fetch"
 }
 
 func (a *App) laborPage(w http.ResponseWriter, r *http.Request) {
@@ -2665,7 +2685,7 @@ const locationShowHTML = `{{define "body"}}
   <table>
     <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th><th>Latest start</th><th>Birthday</th></tr></thead>
     <tbody id="employee-rows">
-    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}" onchange="this.form.submit()"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}" onchange="this.form.submit()"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="7">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="7">No employees imported.</td></tr>{{end}}
     <tr id="employee-filter-empty" hidden><td colspan="7">No employees match these filters.</td></tr>
     </tbody>
   </table>
@@ -2677,6 +2697,7 @@ const locationShowHTML = `{{define "body"}}
   const job = document.getElementById('employee-job-filter');
   const role = document.getElementById('employee-role-filter');
   const department = document.getElementById('employee-department-filter');
+  const assignmentForms = Array.from(document.querySelectorAll('.assignment-form'));
   function matchesAssignment(value, current) {
     if (!value) return true;
     if (value === '__assigned') return current !== '__unassigned';
@@ -2695,6 +2716,33 @@ const locationShowHTML = `{{define "body"}}
     if (empty) empty.hidden = visibleRows().length !== 0;
   }
   [job, role, department].forEach(control => control.addEventListener('input', applyFilters));
+  assignmentForms.forEach(form => {
+    const select = form.querySelector('select');
+    if (!select) return;
+    select.dataset.previousValue = select.value;
+    select.addEventListener('change', async () => {
+      const row = form.closest('tr');
+      const assignment = form.querySelector('input[name="assignment"]').value;
+      const previousValue = select.dataset.previousValue || '';
+      select.disabled = true;
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST',
+          body: new FormData(form),
+          headers: {'X-Requested-With': 'fetch'},
+        });
+        if (!response.ok) throw new Error(await response.text());
+        select.dataset.previousValue = select.value;
+        row.dataset[assignment] = select.value || '__unassigned';
+        applyFilters();
+      } catch (error) {
+        select.value = previousValue;
+        alert((error.message || 'Unable to update assignment').trim());
+      } finally {
+        select.disabled = false;
+      }
+    });
+  });
   applyFilters();
 })();
 </script>

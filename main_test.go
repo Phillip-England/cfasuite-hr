@@ -157,6 +157,53 @@ func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
 	}
 }
 
+func TestEmployeeWagesAreAssignedByEmployeeNumber(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("create first location: %v", err)
+	}
+	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	if err != nil {
+		t.Fatalf("create second location: %v", err)
+	}
+	for _, locationID := range []int64{firstLocationID, secondLocationID} {
+		_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+			VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Manager, Sally", "99", "Director", "Active", "2024-10-01")
+		if err != nil {
+			t.Fatalf("insert employee: %v", err)
+		}
+	}
+	employees, err := listEmployees(db, firstLocationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	wage := int64(750000)
+	updated, err := assignEmployeeWage(db, firstLocationID, []int64{employees[0].ID}, &wage, "salary")
+	if err != nil {
+		t.Fatalf("assignEmployeeWage: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("expected wage assignment to update both location rows, got %d", updated)
+	}
+	for _, locationID := range []int64{firstLocationID, secondLocationID} {
+		employee, err := getEmployee(db, locationID, "99")
+		if err != nil {
+			t.Fatalf("getEmployee: %v", err)
+		}
+		if employee.WageRateCents == nil || *employee.WageRateCents != 750000 || employee.WagePayType != "salary" {
+			t.Fatalf("wage assignment did not propagate to location %d: %#v", locationID, employee)
+		}
+	}
+}
+
 func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {
@@ -516,6 +563,115 @@ Employee Totals 6:00 6:00 $84.00 $84.00
 	}
 }
 
+func TestTimePunchWageRateDrivesSalaryLabor(t *testing.T) {
+	report, err := parseTimePunchText(`Employee Time Detail
+Store
+From Thursday, May 1, 2026 through Sunday, May 31, 2026
+Manager, Sally
+Mon, 05/04/2026 8:00a 8:00a 0:00 Regular $7,500.00 0:00 $0.00 $0.00
+Employee Totals 0:00 0:00 $0.00 $0.00
+`)
+	if err != nil {
+		t.Fatalf("parseTimePunchText returned error: %v", err)
+	}
+	if len(report.Employees) != 1 || report.Employees[0].WageRateCents != 750000 || report.Employees[0].WagePayType != "salary" {
+		t.Fatalf("expected parsed salary wage rate, got %#v", report.Employees)
+	}
+	applyEmployeeAssignments(&report, []Employee{{
+		EmployeeName:   "Manager, Sally",
+		EmployeeNumber: "99",
+		Job:            "Director",
+		WageRateCents:  int64Ptr(750000),
+		WagePayType:    "salary",
+	}})
+	finalizeLaborReport(&report, nil)
+	if report.GrandTotals.WagesCents != 750000 {
+		t.Fatalf("expected full monthly salary in labor total, got %s", formatDollars(report.GrandTotals.WagesCents))
+	}
+	rows := laborJobRows(report)
+	if len(rows) != 1 || rows[0].Job != "Director" || rows[0].Dollars != "$7500.00" {
+		t.Fatalf("expected salary in job labor row, got %#v", rows)
+	}
+}
+
+func TestSalaryLaborUsesReportDayCount(t *testing.T) {
+	days := salaryLaborDays("2026-05-01", "2026-05-01", 750000)
+	total := sumEmployeeDays(LaborEmployee{Days: days})
+	if total.WagesCents != 24194 {
+		t.Fatalf("expected one May day of salary, got %s", formatDollars(total.WagesCents))
+	}
+}
+
+func TestStoredSalaryEmployeeCountsWhenMissingFromTimePunchRows(t *testing.T) {
+	report := TimePunchReport{StartDate: "2026-05-01", EndDate: "2026-05-31"}
+	finalizeLaborReport(&report, []Employee{{
+		EmployeeName:   "Manager, Sally",
+		EmployeeNumber: "99",
+		Job:            "Director",
+		WageRateCents:  int64Ptr(750000),
+		WagePayType:    "salary",
+	}})
+	if len(report.Employees) != 1 || report.GrandTotals.WagesCents != 750000 {
+		t.Fatalf("expected missing salary employee to count, got %#v", report)
+	}
+}
+
+func TestLaborUploadWageUpdateAndExclusion(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Manager, Sally", "99", "Director", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	report, err := parseTimePunchText(`Employee Time Detail
+Store
+From Thursday, May 1, 2026 through Sunday, May 31, 2026
+Manager, Sally
+Mon, 05/04/2026 8:00a 8:00a 0:00 Regular $7,500.00 0:00 $0.00 $0.00
+Employee Totals 0:00 0:00 $0.00 $0.00
+`)
+	if err != nil {
+		t.Fatalf("parseTimePunchText returned error: %v", err)
+	}
+	employees, err := listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	if err := updateEmployeeWagesFromReport(db, report, employees); err != nil {
+		t.Fatalf("updateEmployeeWagesFromReport: %v", err)
+	}
+	employee, err := getEmployee(db, locationID, "99")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.WageRateCents == nil || *employee.WageRateCents != 750000 || employee.WagePayType != "salary" {
+		t.Fatalf("expected stored salary wage details, got %#v", employee)
+	}
+	if _, err := assignEmployeeLaborExclusion(db, locationID, []int64{employee.ID}, true); err != nil {
+		t.Fatalf("assignEmployeeLaborExclusion: %v", err)
+	}
+	employees, err = listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	applyEmployeeAssignments(&report, employees)
+	finalizeLaborReport(&report, employees)
+	if len(report.Employees) != 0 || report.GrandTotals.WagesCents != 0 {
+		t.Fatalf("excluded employee should not count toward labor: %#v", report)
+	}
+}
+
 func TestAdminTemplatesRender(t *testing.T) {
 	templates := []struct {
 		name string
@@ -565,6 +721,25 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"Title":    "Documents",
 				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
 				"Import":   url.Values{"added": []string{"1"}, "updated": []string{"2"}, "removed": []string{"0"}, "skipped": []string{"0"}},
+			},
+		},
+		{
+			name: "location details",
+			body: locationDetailsHTML,
+			data: map[string]any{
+				"Title":    "Employee Details",
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Employees": []Employee{{
+					EmployeeName:            "Blanco, John",
+					EmployeeNumber:          "12-1083836",
+					Job:                     "Team Member",
+					WageRateCents:           int64Ptr(1500),
+					WagePayType:             "hourly",
+					EmployeeStatus:          "Active",
+					LocationLatestStartDate: "2024-10-01",
+					BirthDate:               stringPtr("1999-03-14"),
+				}},
+				"Import": url.Values{},
 			},
 		},
 		{

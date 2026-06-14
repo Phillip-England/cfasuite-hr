@@ -84,6 +84,9 @@ type Employee struct {
 	RoleName                *string   `json:"role_name"`
 	DepartmentID            *int64    `json:"department_id"`
 	DepartmentName          *string   `json:"department_name"`
+	WageRateCents           *int64    `json:"wage_rate_cents"`
+	WagePayType             string    `json:"wage_pay_type"`
+	ExcludeFromLabor        bool      `json:"exclude_from_labor"`
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
 	BirthDate               *string   `json:"birth_date"`
@@ -151,12 +154,16 @@ type TimePunchReport struct {
 }
 
 type LaborEmployee struct {
-	Name       string
-	Job        string
-	Role       string
-	Department string
-	Days       []LaborDay
-	Totals     LaborTotals
+	Name             string
+	Job              string
+	Role             string
+	Department       string
+	EmployeeNumber   string
+	WageRateCents    int64
+	WagePayType      string
+	ExcludeFromLabor bool
+	Days             []LaborDay
+	Totals           LaborTotals
 }
 
 type LaborDay struct {
@@ -436,6 +443,9 @@ func migrate(db *sql.DB) error {
 			job TEXT NOT NULL,
 			role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL,
 			department_id INTEGER REFERENCES departments(id) ON DELETE SET NULL,
+			wage_rate_cents INTEGER,
+			wage_pay_type TEXT NOT NULL DEFAULT '',
+			exclude_from_labor INTEGER NOT NULL DEFAULT 0,
 			employee_status TEXT NOT NULL,
 			location_latest_start_date TEXT NOT NULL,
 			birth_date TEXT,
@@ -471,6 +481,15 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "department_id", "INTEGER REFERENCES departments(id) ON DELETE SET NULL"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "wage_rate_cents", "INTEGER"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "wage_pay_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "exclude_from_labor", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -543,6 +562,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /locations/new", a.requireAdmin(a.locationNew))
 	mux.HandleFunc("POST /locations", a.requireAdmin(a.locationCreate))
 	mux.HandleFunc("GET /locations/{id}", a.requireAdmin(a.locationShow))
+	mux.HandleFunc("GET /locations/{id}/details", a.requireAdmin(a.locationDetails))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
 	mux.HandleFunc("GET /locations/{id}/edit", a.requireAdmin(a.locationEdit))
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
@@ -671,6 +691,29 @@ func (a *App) locationShow(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) locationDetails(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employees, err := listEmployees(a.db, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name+" Employee Details", locationDetailsHTML, map[string]any{
+		"Location":  loc,
+		"Employees": employees,
+		"Import":    r.URL.Query(),
+	})
+}
+
 func (a *App) locationDocuments(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -791,9 +834,101 @@ func (a *App) locationAssignmentsUpdate(w http.ResponseWriter, r *http.Request) 
 	switch r.FormValue("assignment") {
 	case "department":
 		a.updateEmployeeDepartmentAssignments(w, r)
+	case "wage":
+		a.updateEmployeeWages(w, r)
+	case "labor_exclusion":
+		a.updateEmployeeLaborExclusion(w, r)
 	default:
 		a.updateEmployeeRoleAssignments(w, r)
 	}
+}
+
+func (a *App) updateEmployeeWages(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employeeIDs, err := parseInt64Values(r.Form["employee_id"])
+	if err != nil {
+		http.Error(w, "invalid employee selection", http.StatusBadRequest)
+		return
+	}
+	payType := strings.TrimSpace(strings.ToLower(r.FormValue("wage_pay_type")))
+	wage := strings.TrimSpace(r.FormValue("wage_rate"))
+	if payType != "" && payType != "hourly" && payType != "salary" {
+		http.Error(w, "pay type must be hourly or salary", http.StatusBadRequest)
+		return
+	}
+	var cents *int64
+	if wage != "" {
+		if payType != "hourly" && payType != "salary" {
+			http.Error(w, "pay type is required when setting a wage amount", http.StatusBadRequest)
+			return
+		}
+		parsed, err := parseWageCents(wage)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cents = &parsed
+	}
+	updated, err := assignEmployeeWage(a.db, id, employeeIDs, cents, payType)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if wantsAsync(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/details?wages_assigned=%d", id, updated), http.StatusSeeOther)
+}
+
+func (a *App) updateEmployeeLaborExclusion(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employeeIDs, err := parseInt64Values(r.Form["employee_id"])
+	if err != nil {
+		http.Error(w, "invalid employee selection", http.StatusBadRequest)
+		return
+	}
+	excluded := false
+	for _, value := range r.Form["exclude_from_labor"] {
+		if value == "1" {
+			excluded = true
+			break
+		}
+	}
+	updated, err := assignEmployeeLaborExclusion(a.db, id, employeeIDs, excluded)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if wantsAsync(r) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/details?labor_exclusions=%d", id, updated), http.StatusSeeOther)
 }
 
 func (a *App) updateEmployeeRoleAssignments(w http.ResponseWriter, r *http.Request) {
@@ -950,7 +1085,17 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := updateEmployeeWagesFromReport(a.db, report, employees); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	employees, err = listEmployees(a.db, locationID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	applyEmployeeAssignments(&report, employees)
+	finalizeLaborReport(&report, employees)
 	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{
 		"SelectedLocation": loc,
 		"Report":           report,
@@ -1232,6 +1377,18 @@ func templateFuncs() template.FuncMap {
 		"selectedID": func(current *int64, id int64) bool {
 			return current != nil && *current == id
 		},
+		"formatCents": func(cents *int64) string {
+			if cents == nil {
+				return ""
+			}
+			return formatDollars(*cents)
+		},
+		"formatWageInput": func(cents *int64) string {
+			if cents == nil {
+				return ""
+			}
+			return fmt.Sprintf("%.2f", float64(*cents)/100)
+		},
 	}
 }
 
@@ -1468,8 +1625,55 @@ func assignEmployeeDepartment(db *sql.DB, locationID int64, employeeIDs []int64,
 	return updated, tx.Commit()
 }
 
+func assignEmployeeLaborExclusion(db *sql.DB, locationID int64, employeeIDs []int64, excluded bool) (int, error) {
+	value := 0
+	if excluded {
+		value = 1
+	}
+	updated := 0
+	for _, employeeID := range employeeIDs {
+		res, err := db.Exec(`UPDATE employees SET exclude_from_labor = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, value, locationID, employeeID)
+		if err != nil {
+			return 0, err
+		}
+		affected, _ := res.RowsAffected()
+		updated += int(affected)
+	}
+	return updated, nil
+}
+
+func assignEmployeeWage(db *sql.DB, locationID int64, employeeIDs []int64, wageRateCents *int64, payType string) (int, error) {
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	updated := 0
+	for _, employeeID := range employeeIDs {
+		var employeeNumber string
+		if err := tx.QueryRow(`SELECT employee_number FROM employees WHERE location_id = ? AND id = ?`, locationID, employeeID).Scan(&employeeNumber); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return 0, err
+		}
+		var res sql.Result
+		if wageRateCents == nil {
+			res, err = tx.Exec(`UPDATE employees SET wage_rate_cents = NULL, wage_pay_type = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, payType, employeeNumber)
+		} else {
+			res, err = tx.Exec(`UPDATE employees SET wage_rate_cents = ?, wage_pay_type = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, *wageRateCents, payType, employeeNumber)
+		}
+		if err != nil {
+			return 0, err
+		}
+		affected, _ := res.RowsAffected()
+		updated += int(affected)
+	}
+	return updated, tx.Commit()
+}
+
 func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1491,7 +1695,7 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1511,7 +1715,10 @@ func scanEmployee(row scanner) (Employee, error) {
 	var roleName sql.NullString
 	var departmentID sql.NullInt64
 	var departmentName sql.NullString
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
+	var wageRateCents sql.NullInt64
+	var wagePayType sql.NullString
+	var excludeFromLabor int
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
 	if roleID.Valid {
 		e.RoleID = &roleID.Int64
 	}
@@ -1524,6 +1731,13 @@ func scanEmployee(row scanner) (Employee, error) {
 	if departmentName.Valid {
 		e.DepartmentName = &departmentName.String
 	}
+	if wageRateCents.Valid {
+		e.WageRateCents = &wageRateCents.Int64
+	}
+	if wagePayType.Valid {
+		e.WagePayType = wagePayType.String
+	}
+	e.ExcludeFromLabor = excludeFromLabor != 0
 	if birthDate.Valid {
 		e.BirthDate = &birthDate.String
 	}
@@ -1532,28 +1746,37 @@ func scanEmployee(row scanner) (Employee, error) {
 	return e, err
 }
 
-func employeeAssignmentForNumber(tx *sql.Tx, employeeNumber string) (any, any, error) {
+func employeeAssignmentForNumber(tx *sql.Tx, employeeNumber string) (any, any, any, string, error) {
 	var roleID sql.NullInt64
 	var departmentID sql.NullInt64
-	err := tx.QueryRow(`SELECT role_id, department_id FROM employees
-		WHERE employee_number = ? AND (role_id IS NOT NULL OR department_id IS NOT NULL)
+	var wageRateCents sql.NullInt64
+	var wagePayType sql.NullString
+	err := tx.QueryRow(`SELECT role_id, department_id, wage_rate_cents, wage_pay_type FROM employees
+		WHERE employee_number = ? AND (role_id IS NOT NULL OR department_id IS NOT NULL OR wage_rate_cents IS NOT NULL OR wage_pay_type != '')
 		ORDER BY updated_at DESC, id DESC
-		LIMIT 1`, employeeNumber).Scan(&roleID, &departmentID)
+		LIMIT 1`, employeeNumber).Scan(&roleID, &departmentID, &wageRateCents, &wagePayType)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, nil
+		return nil, nil, nil, "", nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, "", err
 	}
 	var role any
 	var department any
+	var wage any
 	if roleID.Valid {
 		role = roleID.Int64
 	}
 	if departmentID.Valid {
 		department = departmentID.Int64
 	}
-	return role, department, nil
+	if wageRateCents.Valid {
+		wage = wageRateCents.Int64
+	}
+	if wagePayType.Valid {
+		return role, department, wage, wagePayType.String, nil
+	}
+	return role, department, wage, "", nil
 }
 
 func importBio(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
@@ -1585,12 +1808,12 @@ func importBio(db *sql.DB, locationID int64, file multipart.File, header *multip
 		err := tx.QueryRow(`SELECT id FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, employee.Number).Scan(&existingID)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			roleID, departmentID, err := employeeAssignmentForNumber(tx, employee.Number)
+			roleID, departmentID, wageRateCents, wagePayType, err := employeeAssignmentForNumber(tx, employee.Number)
 			if err != nil {
 				return ImportResult{}, err
 			}
-			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, department_id, employee_status, location_latest_start_date)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, roleID, departmentID, "Active", employee.LatestStartDate)
+			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, department_id, wage_rate_cents, wage_pay_type, employee_status, location_latest_start_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, roleID, departmentID, wageRateCents, wagePayType, "Active", employee.LatestStartDate)
 			if err != nil {
 				return ImportResult{}, err
 			}
@@ -1811,6 +2034,10 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 		if matches == nil || current == nil {
 			continue
 		}
+		if wageRate := firstMoneyCents(matches[5]); wageRate > 0 {
+			current.WageRateCents = wageRate
+			current.WagePayType = wagePayTypeForRate(wageRate)
+		}
 		payType := strings.ToLower(matches[4])
 		minutes := 0
 		if payType == "regular" {
@@ -1907,16 +2134,26 @@ func sumEmployeeDays(employee LaborEmployee) LaborTotals {
 
 func applyEmployeeAssignments(report *TimePunchReport, employees []Employee) {
 	type assignment struct {
-		job        string
-		role       string
-		department string
+		number           string
+		job              string
+		role             string
+		department       string
+		wageRateCents    int64
+		wagePayType      string
+		excludeFromLabor bool
 	}
 	byName := map[string]assignment{}
 	for _, employee := range employees {
 		current := assignment{
-			job:        strings.TrimSpace(employee.Job),
-			role:       "Unassigned",
-			department: "Unassigned",
+			number:           employee.EmployeeNumber,
+			job:              strings.TrimSpace(employee.Job),
+			role:             "Unassigned",
+			department:       "Unassigned",
+			wagePayType:      strings.TrimSpace(employee.WagePayType),
+			excludeFromLabor: employee.ExcludeFromLabor,
+		}
+		if employee.WageRateCents != nil {
+			current.wageRateCents = *employee.WageRateCents
 		}
 		if employee.RoleName != nil && strings.TrimSpace(*employee.RoleName) != "" {
 			current.role = strings.TrimSpace(*employee.RoleName)
@@ -1928,12 +2165,18 @@ func applyEmployeeAssignments(report *TimePunchReport, employees []Employee) {
 	}
 	for i := range report.Employees {
 		if assignment, ok := byName[normalizeName(report.Employees[i].Name)]; ok {
+			report.Employees[i].EmployeeNumber = assignment.number
 			report.Employees[i].Job = assignment.job
 			if report.Employees[i].Job == "" {
 				report.Employees[i].Job = "Unmatched"
 			}
 			report.Employees[i].Role = assignment.role
 			report.Employees[i].Department = assignment.department
+			if assignment.wageRateCents > 0 {
+				report.Employees[i].WageRateCents = assignment.wageRateCents
+				report.Employees[i].WagePayType = assignment.wagePayType
+			}
+			report.Employees[i].ExcludeFromLabor = assignment.excludeFromLabor
 		} else {
 			report.Employees[i].Job = "Unmatched"
 			report.Employees[i].Role = "Unmatched"
@@ -1944,6 +2187,122 @@ func applyEmployeeAssignments(report *TimePunchReport, employees []Employee) {
 
 func applyEmployeeJobs(report *TimePunchReport, employees []Employee) {
 	applyEmployeeAssignments(report, employees)
+}
+
+func updateEmployeeWagesFromReport(db *sql.DB, report TimePunchReport, employees []Employee) error {
+	byName := map[string]Employee{}
+	for _, employee := range employees {
+		byName[normalizeName(employee.EmployeeName)] = employee
+	}
+	for _, laborEmployee := range report.Employees {
+		if laborEmployee.WageRateCents <= 0 {
+			continue
+		}
+		employee, ok := byName[normalizeName(laborEmployee.Name)]
+		if !ok {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE employees SET wage_rate_cents = ?, wage_pay_type = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, laborEmployee.WageRateCents, wagePayTypeForRate(laborEmployee.WageRateCents), employee.EmployeeNumber); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func finalizeLaborReport(report *TimePunchReport, employees []Employee) {
+	addMissingSalaryEmployees(report, employees)
+	applySalaryLabor(report)
+	filterExcludedLabor(report)
+	recalculateReportTotals(report)
+}
+
+func addMissingSalaryEmployees(report *TimePunchReport, employees []Employee) {
+	seen := map[string]bool{}
+	for _, employee := range report.Employees {
+		if employee.EmployeeNumber != "" {
+			seen[employee.EmployeeNumber] = true
+		}
+	}
+	for _, employee := range employees {
+		if employee.WagePayType != "salary" || employee.WageRateCents == nil || employee.ExcludeFromLabor || seen[employee.EmployeeNumber] {
+			continue
+		}
+		role := "Unassigned"
+		if employee.RoleName != nil && strings.TrimSpace(*employee.RoleName) != "" {
+			role = strings.TrimSpace(*employee.RoleName)
+		}
+		department := "Unassigned"
+		if employee.DepartmentName != nil && strings.TrimSpace(*employee.DepartmentName) != "" {
+			department = strings.TrimSpace(*employee.DepartmentName)
+		}
+		report.Employees = append(report.Employees, LaborEmployee{
+			Name:           employee.EmployeeName,
+			EmployeeNumber: employee.EmployeeNumber,
+			Job:            employee.Job,
+			Role:           role,
+			Department:     department,
+			WageRateCents:  *employee.WageRateCents,
+			WagePayType:    employee.WagePayType,
+		})
+	}
+}
+
+func applySalaryLabor(report *TimePunchReport) {
+	for i := range report.Employees {
+		employee := &report.Employees[i]
+		if employee.WagePayType != "salary" || employee.WageRateCents <= 0 {
+			continue
+		}
+		employee.Days = salaryLaborDays(report.StartDate, report.EndDate, employee.WageRateCents)
+		employee.Totals = sumEmployeeDays(*employee)
+	}
+}
+
+func filterExcludedLabor(report *TimePunchReport) {
+	employees := report.Employees[:0]
+	for _, employee := range report.Employees {
+		if !employee.ExcludeFromLabor {
+			employees = append(employees, employee)
+		}
+	}
+	report.Employees = employees
+}
+
+func recalculateReportTotals(report *TimePunchReport) {
+	report.GrandTotals = LaborTotals{}
+	for _, employee := range report.Employees {
+		report.GrandTotals.Minutes += employee.Totals.Minutes
+		report.GrandTotals.WagesCents += employee.Totals.WagesCents
+	}
+}
+
+func salaryLaborDays(startDate, endDate string, monthlyCents int64) []LaborDay {
+	start, err := time.Parse("2006-01-02", startDate)
+	if err != nil {
+		return nil
+	}
+	end, err := time.Parse("2006-01-02", endDate)
+	if err != nil || end.Before(start) {
+		end = start
+	}
+	var days []LaborDay
+	monthCounts := map[string]int{}
+	for current := start; !current.After(end); current = current.AddDate(0, 0, 1) {
+		_, month, _ := current.Date()
+		daysInMonth := time.Date(current.Year(), month+1, 0, 0, 0, 0, 0, current.Location()).Day()
+		monthKey := current.Format("2006-01")
+		monthCounts[monthKey]++
+		wagesCents := monthlyCents / int64(daysInMonth)
+		if int64(monthCounts[monthKey]) <= monthlyCents%int64(daysInMonth) {
+			wagesCents++
+		}
+		days = append(days, LaborDay{
+			Weekday:    current.Weekday().String(),
+			Date:       current.Format("2006-01-02"),
+			WagesCents: wagesCents,
+		})
+	}
+	return days
 }
 
 func laborSummary(report TimePunchReport) []LaborSummary {
@@ -2168,12 +2527,27 @@ func lastMoneyCents(text string) int64 {
 	return parseMoneyCents(matches[len(matches)-1])
 }
 
+func firstMoneyCents(text string) int64 {
+	matches := moneyRe.FindAllString(text, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	return parseMoneyCents(matches[0])
+}
+
 func punchWagesCents(text string) int64 {
 	matches := moneyRe.FindAllString(text, -1)
 	if len(matches) < 2 {
 		return 0
 	}
 	return parseMoneyCents(matches[len(matches)-1])
+}
+
+func wagePayTypeForRate(cents int64) string {
+	if cents > 10000 {
+		return "salary"
+	}
+	return "hourly"
 }
 
 func parseMoneyCents(value string) int64 {
@@ -2192,6 +2566,37 @@ func parseMoneyCents(value string) int64 {
 		cents, _ = strconv.ParseInt(fraction, 10, 64)
 	}
 	return dollars*100 + cents
+}
+
+func parseWageCents(value string) (int64, error) {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.ReplaceAll(value, ",", ""), "$"))
+	if value == "" {
+		return 0, errors.New("wage amount is required")
+	}
+	parts := strings.SplitN(value, ".", 2)
+	dollars, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || dollars < 0 {
+		return 0, errors.New("wage amount must be a positive dollar amount")
+	}
+	var cents int64
+	if len(parts) == 2 {
+		fraction := parts[1]
+		if len(fraction) > 2 {
+			return 0, errors.New("wage amount can only include cents")
+		}
+		for len(fraction) < 2 {
+			fraction += "0"
+		}
+		cents, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil || cents < 0 {
+			return 0, errors.New("wage amount must be a positive dollar amount")
+		}
+	}
+	total := dollars*100 + cents
+	if total <= 0 {
+		return 0, errors.New("wage amount must be greater than zero")
+	}
+	return total, nil
 }
 
 func normalizeUSDate(value string) string {
@@ -2437,6 +2842,8 @@ Important data rules:
 - Employee numbers are strings.
 - Employees are active employees from the latest employee bio import.
 - job is the imported Chick-fil-A job field. role_id, role_name, department_id, and department_name are internal cfasuite-hr assignments and may be null.
+- wage_rate_cents and wage_pay_type are learned from uploaded time punch reports. wage_pay_type is "hourly", "salary", or empty when unknown.
+- exclude_from_labor is location-specific and means the employee is omitted from that location's Labor Board calculations.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
 - Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
 
@@ -2520,6 +2927,9 @@ type Employee struct {
 	RoleName                *string `+"`json:\"role_name\"`"+`
 	DepartmentID            *int64 `+"`json:\"department_id\"`"+`
 	DepartmentName          *string `+"`json:\"department_name\"`"+`
+	WageRateCents           *int64 `+"`json:\"wage_rate_cents\"`"+`
+	WagePayType             string `+"`json:\"wage_pay_type\"`"+`
+	ExcludeFromLabor        bool `+"`json:\"exclude_from_labor\"`"+`
 	EmployeeStatus          string `+"`json:\"employee_status\"`"+`
 	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
 	BirthDate               *string `+"`json:\"birth_date\"`"+`
@@ -2763,6 +3173,7 @@ const locationShowHTML = `{{define "body"}}
 </div>
 <nav class="portal-menu">
   <a class="active" href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -2787,7 +3198,7 @@ const locationShowHTML = `{{define "body"}}
 </section>
 <section>
   <div class="section-head compact">
-    <h2>Employees</h2>
+    <h2>Employee overview</h2>
     <div class="assignment-status" aria-label="Assignment status">
       <span><strong id="role-unassigned-count">{{.AssignmentStatus.RoleUnassigned}}</strong> no role</span>
       <span><strong id="department-unassigned-count">{{.AssignmentStatus.DepartmentUnassigned}}</strong> no department</span>
@@ -2820,10 +3231,10 @@ const locationShowHTML = `{{define "body"}}
     </label>
   </div>
   <table>
-    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th><th>Latest start</th><th>Birthday</th></tr></thead>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th></tr></thead>
     <tbody id="employee-rows">
-    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="7">No employees imported.</td></tr>{{end}}
-    <tr id="employee-filter-empty" hidden><td colspan="7">No employees match these filters.</td></tr>
+    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    <tr id="employee-filter-empty" hidden><td colspan="5">No employees match these filters.</td></tr>
     </tbody>
   </table>
 </section>
@@ -2860,15 +3271,15 @@ const locationShowHTML = `{{define "body"}}
   }
   [job, role, department].forEach(control => control.addEventListener('input', applyFilters));
   assignmentForms.forEach(form => {
-    const select = form.querySelector('select');
-    if (!select) return;
-    select.dataset.previousValue = select.value;
-    select.addEventListener('change', async () => {
+    const control = form.querySelector('select, input[type="checkbox"]');
+    if (!control) return;
+    control.dataset.previousValue = control.type === 'checkbox' ? String(control.checked) : control.value;
+    control.addEventListener('change', async () => {
       const row = form.closest('tr');
       const assignment = form.querySelector('input[name="assignment"]').value;
-      const previousValue = select.dataset.previousValue || '';
+      const previousValue = control.dataset.previousValue || '';
       const data = new FormData(form);
-      select.disabled = true;
+      control.disabled = true;
       try {
         const response = await fetch(form.action, {
           method: 'POST',
@@ -2876,20 +3287,143 @@ const locationShowHTML = `{{define "body"}}
           headers: {'X-Requested-With': 'fetch'},
         });
         if (!response.ok) throw new Error(await response.text());
-        select.dataset.previousValue = select.value;
-        row.dataset[assignment] = select.value || '__unassigned';
-        updateAssignmentStatus();
-        applyFilters();
+        control.dataset.previousValue = control.type === 'checkbox' ? String(control.checked) : control.value;
+        if (assignment === 'role' || assignment === 'department') {
+          row.dataset[assignment] = control.value || '__unassigned';
+          updateAssignmentStatus();
+          applyFilters();
+        }
       } catch (error) {
-        select.value = previousValue;
+        if (control.type === 'checkbox') {
+          control.checked = previousValue === 'true';
+        } else {
+          control.value = previousValue;
+        }
         alert((error.message || 'Unable to update assignment').trim());
       } finally {
-        select.disabled = false;
+        control.disabled = false;
       }
     });
   });
   updateAssignmentStatus();
   applyFilters();
+})();
+</script>
+{{end}}`
+
+const locationDetailsHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Employee Details</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a class="active" href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+</nav>
+<section class="overview-grid">
+  <article class="metric">
+    <span>Store number</span>
+    <strong>{{.Location.Number}}</strong>
+  </article>
+  <article class="metric">
+    <span>Active employees</span>
+    <strong>{{len .Employees}}</strong>
+  </article>
+  <article class="metric">
+    <span>Created</span>
+    <strong>{{.Location.CreatedAt.Format "2006-01-02"}}</strong>
+  </article>
+  <article class="metric">
+    <span>Updated</span>
+    <strong>{{.Location.UpdatedAt.Format "2006-01-02"}}</strong>
+  </article>
+</section>
+{{if .Import.Get "wages_assigned"}}<p class="notice">Updated wages for {{.Import.Get "wages_assigned"}} employee records.</p>{{end}}
+{{if .Import.Get "labor_exclusions"}}<p class="notice">Updated labor exclusion for {{.Import.Get "labor_exclusions"}} employees.</p>{{end}}
+<section>
+  <div class="section-head">
+    <h2>Employee details</h2>
+    <label class="search-control">Name
+      <input id="employee-detail-search" type="search" placeholder="Filter by name">
+    </label>
+  </div>
+  <table>
+    <thead><tr><th>Name</th><th>Start date</th><th>Pay type</th><th>Wage</th><th>Birthday</th><th>Exclude labor</th></tr></thead>
+    <tbody id="employee-detail-rows">
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
+    <tr id="employee-detail-empty" hidden><td colspan="6">No employees match this filter.</td></tr>
+    </tbody>
+  </table>
+</section>
+<script>
+(() => {
+  const rows = Array.from(document.querySelectorAll('#employee-detail-rows tr[data-name]'));
+  const empty = document.getElementById('employee-detail-empty');
+  const search = document.getElementById('employee-detail-search');
+  if (search) {
+    search.addEventListener('input', () => {
+      const value = search.value.trim().toLowerCase();
+      rows.forEach(row => row.hidden = value && !(row.dataset.name || '').toLowerCase().includes(value));
+      if (empty) empty.hidden = rows.some(row => !row.hidden);
+    });
+  }
+  async function submitForm(form) {
+    const controls = Array.from(form.querySelectorAll('input, select'));
+    const previous = controls.map(control => control.type === 'checkbox' ? control.checked : control.value);
+    controls.forEach(control => control.disabled = true);
+    try {
+      const response = await fetch(form.action, {
+        method: 'POST',
+        body: new FormData(form),
+        headers: {'X-Requested-With': 'fetch'},
+      });
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      controls.forEach((control, index) => {
+        if (control.type === 'checkbox') control.checked = previous[index];
+        else control.value = previous[index];
+      });
+      alert((error.message || 'Unable to update employee details').trim());
+    } finally {
+      controls.forEach(control => control.disabled = false);
+    }
+  }
+  document.querySelectorAll('.labor-exclusion-form input[type="checkbox"]').forEach(control => {
+    control.addEventListener('change', () => submitForm(control.form));
+  });
+  document.querySelectorAll('.wage-form select').forEach(control => {
+    control.addEventListener('change', () => {
+      const row = control.closest('tr');
+      const wageInput = row ? row.querySelector('input[name="wage_rate"]:not([type="hidden"])') : null;
+      const ownHiddenWage = control.form.querySelector('input[name="wage_rate"]');
+      if (wageInput && ownHiddenWage) ownHiddenWage.value = wageInput.value;
+      if (wageInput) {
+        const hiddenPayType = wageInput.form.querySelector('input[name="wage_pay_type"]');
+        if (hiddenPayType) hiddenPayType.value = control.value;
+      }
+      submitForm(control.form);
+    });
+  });
+  document.querySelectorAll('.wage-form input[name="wage_rate"]').forEach(control => {
+    if (control.type === 'hidden') return;
+    control.addEventListener('change', () => {
+      const row = control.closest('tr');
+      const selectFormHiddenWage = row ? row.querySelector('select[name="wage_pay_type"]')?.form.querySelector('input[name="wage_rate"]') : null;
+      if (selectFormHiddenWage) selectFormHiddenWage.value = control.value;
+      submitForm(control.form);
+    });
+    control.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        control.blur();
+      }
+    });
+  });
 })();
 </script>
 {{end}}`
@@ -2903,6 +3437,7 @@ const locationDocumentsHTML = `{{define "body"}}
 </div>
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -2934,6 +3469,7 @@ const locationEditHTML = `{{define "body"}}
 </div>
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -2963,6 +3499,7 @@ const laborHTML = `{{define "body"}}
 </div>
 <nav class="portal-menu">
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>

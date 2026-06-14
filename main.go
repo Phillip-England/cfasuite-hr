@@ -494,8 +494,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
-	mux.HandleFunc("GET /labor", a.requireAdmin(a.laborPage))
-	mux.HandleFunc("POST /labor", a.requireAdmin(a.laborUpload))
+	mux.HandleFunc("GET /locations/{id}/labor", a.requireAdmin(a.laborPage))
+	mux.HandleFunc("POST /locations/{id}/labor", a.requireAdmin(a.laborUpload))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
 	mux.HandleFunc("POST /tokens", a.requireAdmin(a.tokenCreate))
 	mux.HandleFunc("POST /tokens/{id}/delete", a.requireAdmin(a.tokenDelete))
@@ -673,28 +673,33 @@ func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) laborPage(w http.ResponseWriter, r *http.Request) {
-	locations, err := listLocations(a.db)
+	locationID, err := pathID(r, "id")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	a.render(w, "Labor", laborHTML, map[string]any{"Locations": locations})
-}
-
-func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	locationID, err := strconv.ParseInt(r.FormValue("location_id"), 10, 64)
-	if err != nil || locationID == 0 {
-		http.Error(w, "location is required", http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
 	loc, err := getLocation(a.db, locationID)
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{"SelectedLocation": loc})
+}
+
+func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	file, header, err := r.FormFile("time_punch")
@@ -714,13 +719,7 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyEmployeeJobs(&report, employees)
-	locations, err := listLocations(a.db)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	a.render(w, "Labor", laborHTML, map[string]any{
-		"Locations":        locations,
+	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{
 		"SelectedLocation": loc,
 		"Report":           report,
 		"Summary":          laborSummary(report),
@@ -1257,7 +1256,7 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 			Weekday:    titleWeekday(matches[1]),
 			Date:       normalizeUSDate(matches[2]),
 			Minutes:    minutes,
-			WagesCents: lastMoneyCents(matches[5]),
+			WagesCents: punchWagesCents(matches[5]),
 		}
 		addLaborDay(current, day)
 	}
@@ -1276,6 +1275,7 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 }
 
 func cleanReportLines(text string) []string {
+	text = normalizeTimePunchText(text)
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.ReplaceAll(line, "\f", " ")
@@ -1285,6 +1285,23 @@ func cleanReportLines(text string) []string {
 		}
 	}
 	return lines
+}
+
+func normalizeTimePunchText(text string) string {
+	compact := strings.Join(strings.Fields(strings.ReplaceAll(text, "\f", " ")), " ")
+	if compact == "" {
+		return ""
+	}
+	compact = strings.ReplaceAll(compact, "Employee Time Detail", "\nEmployee Time Detail\n")
+	compact = reportHeaderRe.ReplaceAllString(compact, "\n")
+	compact = strings.ReplaceAll(compact, "Punch types of", "\nPunch types of")
+	compact = fromPeriodInlineRe.ReplaceAllString(compact, "$1\nFrom $2")
+	compact = periodThenEmployeeRe.ReplaceAllString(compact, "$1\n$2")
+	compact = employeeTotalsInlineRe.ReplaceAllString(compact, "\nEmployee Totals")
+	compact = grandTotalsInlineRe.ReplaceAllString(compact, "\nAll Employees Grand Total")
+	compact = moneyThenEmployeeRe.ReplaceAllString(compact, "$1\n$2")
+	compact = weekdayInlineRe.ReplaceAllString(compact, "\n$1, ")
+	return compact
 }
 
 func ignoreTimePunchLine(line string) bool {
@@ -1451,6 +1468,14 @@ func lastMoneyCents(text string) int64 {
 	return parseMoneyCents(matches[len(matches)-1])
 }
 
+func punchWagesCents(text string) int64 {
+	matches := moneyRe.FindAllString(text, -1)
+	if len(matches) < 2 {
+		return 0
+	}
+	return parseMoneyCents(matches[len(matches)-1])
+}
+
 func parseMoneyCents(value string) int64 {
 	normalized := strings.TrimPrefix(strings.ReplaceAll(value, ",", ""), "$")
 	parts := strings.SplitN(normalized, ".", 2)
@@ -1477,8 +1502,10 @@ func normalizeUSDate(value string) string {
 }
 
 func formatLongDate(value string) string {
-	if t, err := time.Parse("Monday, January 2, 2006", value); err == nil {
-		return t.Format("2006-01-02")
+	for _, layout := range []string{"Monday, January 2, 2006", "Monday, Jan 2, 2006", "Monday, Jan 02, 2006"} {
+		if t, err := time.Parse(layout, value); err == nil {
+			return t.Format("2006-01-02")
+		}
 	}
 	return value
 }
@@ -1851,13 +1878,20 @@ func urlText(s string) string {
 }
 
 var (
-	punchLineRe       = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(\d{2}/\d{2}/\d{4})\s+\d{1,2}:\d{2}\s*[ap]\*?\s+\d{1,2}:\d{2}\s*[ap]\*?\s+(\d{1,4}:\d{2})\s+(Regular|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
-	employeeTotalsRe  = regexp.MustCompile(`^Employee Totals\s+(\d{1,4}:\d{2})(.*)$`)
-	grandTotalsRe     = regexp.MustCompile(`^All Employees Grand Total\s+(\d{1,4}:\d{2})(.*)$`)
-	periodRe          = regexp.MustCompile(`^From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+through\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})$`)
-	moneyRe           = regexp.MustCompile(`\$[\d,]+\.\d{2}`)
-	employeeNameRe    = regexp.MustCompile(`^[A-Za-z][A-Za-z ,.'()/-]+$`)
-	footerTimestampRe = regexp.MustCompile(`^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M`)
+	punchLineRe            = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*(\d{2}/\d{2}/\d{4})\s*\d{1,2}:\d{2}\s*[ap]\*?\s*(?:\d{1,2}:\d{2}\s*[ap]\*?|Open Punch)\s*(\d{1,4}:\d{2})\s*(Regular|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
+	employeeTotalsRe       = regexp.MustCompile(`^Employee Totals\s*(\d{1,4}:\d{2})(.*)$`)
+	grandTotalsRe          = regexp.MustCompile(`^All Employees Grand Total\s*(\d{1,4}:\d{2})(.*)$`)
+	periodRe               = regexp.MustCompile(`^From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+through\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})$`)
+	moneyRe                = regexp.MustCompile(`\$[\d,]+\.\d{2}`)
+	employeeNameRe         = regexp.MustCompile(`^[A-Za-z][A-Za-z ,.'()/-]+$`)
+	footerTimestampRe      = regexp.MustCompile(`^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M`)
+	reportHeaderRe         = regexp.MustCompile(`EmployeeNameDateTimeInTimeOutTotalTimePayTypeWageRateRegularOvertimeTotal WagesHoursWagesHoursWages`)
+	fromPeriodInlineRe     = regexp.MustCompile(`([A-Za-z0-9.)])\s*From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+through\s+[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})`)
+	periodThenEmployeeRe   = regexp.MustCompile(`(From\s+[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s+through\s+[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+([A-Z][A-Za-z .'\-/()]+,\s)`)
+	employeeTotalsInlineRe = regexp.MustCompile(`\s*Employee Totals\s*`)
+	grandTotalsInlineRe    = regexp.MustCompile(`\s*All Employees Grand Total\s*`)
+	moneyThenEmployeeRe    = regexp.MustCompile(`(\$[\d,]+\.\d{2})\s*([A-Z][A-Za-z .'\-/()]+,\s)`)
+	weekdayInlineRe        = regexp.MustCompile(`\s+(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s*`)
 )
 
 func env(key, fallback string) string {
@@ -1903,7 +1937,6 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
     <a class="brand" href="/">cfasuite-hr</a>
     {{if not .LoggedOut}}<nav>
       <a href="/">Locations</a>
-      <a href="/labor">Labor</a>
       <a href="/tokens">API Tokens</a>
       <a href="/docs">API Docs</a>
       <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
@@ -1962,7 +1995,10 @@ const locationShowHTML = `{{define "body"}}
     <h1>{{.Location.Name}}</h1>
     <p class="muted">Store {{.Location.Number}}</p>
   </div>
-  <form method="post" action="/locations/{{.Location.ID}}/delete" onsubmit="return confirm('Delete this location and its employees?')"><button class="danger">Delete</button></form>
+  <div class="actions">
+    <a class="button secondary" href="/locations/{{.Location.ID}}/labor">Labor board</a>
+    <form method="post" action="/locations/{{.Location.ID}}/delete" onsubmit="return confirm('Delete this location and its employees?')"><button class="danger">Delete</button></form>
+  </div>
 </div>
 {{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported for {{.Location.Name}}. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees at this location.</p>{{end}}
 <section class="split">
@@ -1999,17 +2035,12 @@ const locationShowHTML = `{{define "body"}}
 const laborHTML = `{{define "body"}}
 <div class="row">
   <div>
-    <h1>Labor</h1>
-    <p class="muted">Upload an Employee Time Detail PDF for one location.</p>
+    <h1>{{.SelectedLocation.Name}} Labor</h1>
+    <p class="muted">Store {{.SelectedLocation.Number}}</p>
   </div>
+  <a class="button secondary" href="/locations/{{.SelectedLocation.ID}}">Back to location</a>
 </div>
-<form method="post" action="/labor" enctype="multipart/form-data" class="panel labor-upload">
-  <label>Location
-    <select name="location_id" required>
-      <option value="">Select location</option>
-      {{range .Locations}}<option value="{{.ID}}" {{if $.SelectedLocation}}{{if eq $.SelectedLocation.ID .ID}}selected{{end}}{{end}}>{{.Name}} - Store {{.Number}}</option>{{end}}
-    </select>
-  </label>
+<form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
   <label>Time punch report
     <input type="file" name="time_punch" accept=".pdf" required>
   </label>
@@ -2092,6 +2123,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr 1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.inline,.labor-upload,.report-head,.summary-grid{display:block}.row>*{margin-bottom:12px}.labor-upload label,.summary-grid .metric{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

@@ -178,6 +178,36 @@ All Employees Grand Total 17:30 17:30 $256.50 $256.50
 	}
 }
 
+func TestParseTimePunchPDFSample(t *testing.T) {
+	data, err := os.ReadFile("tp.pdf")
+	if err != nil {
+		t.Skip("tp.pdf fixture is not present")
+	}
+	report, err := parseTimePunchPDF(multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "tp.pdf"})
+	if err != nil {
+		t.Fatalf("parseTimePunchPDF returned error: %v", err)
+	}
+	if report.LocationName != "Southroads Shopping Center FSU" {
+		t.Fatalf("unexpected location name: %q", report.LocationName)
+	}
+	if report.StartDate != "2026-06-07" || report.EndDate != "2026-06-20" {
+		t.Fatalf("unexpected report period: %q through %q", report.StartDate, report.EndDate)
+	}
+	if len(report.Employees) < 80 {
+		t.Fatalf("expected sample report employees to parse, got %d", len(report.Employees))
+	}
+	if report.GrandTotals.Minutes != 146658 || report.GrandTotals.WagesCents != 3907311 {
+		t.Fatalf("unexpected grand totals: %#v", report.GrandTotals)
+	}
+	dayRows := laborDayRows(report)
+	if len(dayRows) != 8 {
+		t.Fatalf("expected 8 day rows, got %#v", dayRows)
+	}
+	if dayRows[0].Date != "2026-06-07" || dayRows[0].Hours == "0.00" || dayRows[0].Dollars == "$0.00" {
+		t.Fatalf("unexpected first day row: %#v", dayRows[0])
+	}
+}
+
 func TestLaborJobRowsUsesEmployeeJobs(t *testing.T) {
 	report, err := parseTimePunchText(`Employee Time Detail
 Store
@@ -242,7 +272,6 @@ func TestAdminTemplatesRender(t *testing.T) {
 			body: laborHTML,
 			data: map[string]any{
 				"Title":            "Labor",
-				"Locations":        []Location{{ID: 1, Name: "Southroads", Number: "03394"}},
 				"SelectedLocation": Location{ID: 1, Name: "Southroads", Number: "03394"},
 				"Report":           TimePunchReport{PeriodLabel: "From Monday, May 11, 2026 through Saturday, May 16, 2026"},
 				"Summary":          []LaborSummary{{Label: "Total week", Hours: "10.00", Dollars: "$100.00"}},

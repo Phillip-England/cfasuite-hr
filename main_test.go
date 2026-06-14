@@ -469,7 +469,7 @@ func TestAdminTemplatesRender(t *testing.T) {
 	}
 	for _, tt := range templates {
 		t.Run(tt.name, func(t *testing.T) {
-			tmpl, err := template.New("layout").Parse(layoutHTML + tt.body)
+			tmpl, err := template.New("layout").Funcs(templateFuncs()).Parse(layoutHTML + tt.body)
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}

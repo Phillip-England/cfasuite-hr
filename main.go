@@ -1188,10 +1188,18 @@ func (a *App) validSession(r *http.Request) bool {
 
 func (a *App) render(w http.ResponseWriter, title, body string, data map[string]any) {
 	data["Title"] = title
-	tmpl := template.Must(template.New("layout").Parse(layoutHTML + body))
+	tmpl := template.Must(template.New("layout").Funcs(templateFuncs()).Parse(layoutHTML + body))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tmpl.ExecuteTemplate(w, "layout", data); err != nil {
 		log.Printf("render: %v", err)
+	}
+}
+
+func templateFuncs() template.FuncMap {
+	return template.FuncMap{
+		"selectedID": func(current *int64, id int64) bool {
+			return current != nil && *current == id
+		},
 	}
 }
 
@@ -2654,38 +2662,17 @@ const locationShowHTML = `{{define "body"}}
       </select>
     </label>
   </div>
-  <form method="post" action="/locations/{{.Location.ID}}/assignments">
-  <div class="bulk-actions employee-assignments">
-    <label>Role
-      <select name="role_id">
-        <option value="">Unassigned</option>
-        {{range .Roles}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-      </select>
-    </label>
-    <button name="assignment" value="role">Apply role</button>
-    <label>Department
-      <select name="department_id">
-        <option value="">Unassigned</option>
-        {{range .Departments}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-      </select>
-    </label>
-    <button name="assignment" value="department">Apply department</button>
-  </div>
   <table>
-    <thead><tr><th class="check"><input type="checkbox" id="check-all-employees" aria-label="Select visible employees"></th><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th><th>Latest start</th><th>Birthday</th></tr></thead>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th><th>Latest start</th><th>Birthday</th></tr></thead>
     <tbody id="employee-rows">
-    {{range .Employees}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td class="check"><input type="checkbox" name="employee_id" value="{{.ID}}" aria-label="Select {{.EmployeeName}}"></td><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td>{{if .RoleName}}{{.RoleName}}{{else}}<span class="muted">Unassigned</span>{{end}}</td><td>{{if .DepartmentName}}{{.DepartmentName}}{{else}}<span class="muted">Unassigned</span>{{end}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="8">No employees imported.</td></tr>{{end}}
-    <tr id="employee-filter-empty" hidden><td colspan="8">No employees match these filters.</td></tr>
+    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}" onchange="this.form.submit()"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}" onchange="this.form.submit()"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td></tr>{{else}}<tr><td colspan="7">No employees imported.</td></tr>{{end}}
+    <tr id="employee-filter-empty" hidden><td colspan="7">No employees match these filters.</td></tr>
     </tbody>
   </table>
-  </form>
 </section>
 <script>
 (() => {
-  const all = document.getElementById('check-all-employees');
-  if (!all) return;
   const rows = Array.from(document.querySelectorAll('#employee-rows tr[data-job]'));
-  const boxes = rows.map(row => row.querySelector('input[name="employee_id"]'));
   const empty = document.getElementById('employee-filter-empty');
   const job = document.getElementById('employee-job-filter');
   const role = document.getElementById('employee-role-filter');
@@ -2704,12 +2691,9 @@ const locationShowHTML = `{{define "body"}}
         !matchesAssignment(role.value, row.dataset.role) ||
         !matchesAssignment(department.value, row.dataset.department);
       row.hidden = hidden;
-      if (hidden) row.querySelector('input[name="employee_id"]').checked = false;
     });
-    all.checked = false;
     if (empty) empty.hidden = visibleRows().length !== 0;
   }
-  all.addEventListener('change', () => visibleRows().forEach(row => { row.querySelector('input[name="employee_id"]').checked = all.checked; }));
   [job, role, department].forEach(control => control.addEventListener('input', applyFilters));
   applyFilters();
 })();
@@ -2993,6 +2977,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.employee-assignments{grid-template-columns:minmax(180px,1fr) auto minmax(180px,1fr) auto}.bulk-actions label{margin:0}.check{width:44px;text-align:center}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head h2{margin:0}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head h2{margin:0}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

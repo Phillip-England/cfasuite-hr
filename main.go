@@ -3393,11 +3393,12 @@ const locationDetailsHTML = `{{define "body"}}
   async function submitForm(form) {
     const controls = Array.from(form.querySelectorAll('input, select'));
     const previous = controls.map(control => control.type === 'checkbox' ? control.checked : control.value);
+    const data = new FormData(form);
     controls.forEach(control => control.disabled = true);
     try {
       const response = await fetch(form.action, {
         method: 'POST',
-        body: new FormData(form),
+        body: data,
         headers: {'X-Requested-With': 'fetch'},
       });
       if (!response.ok) throw new Error(await response.text());

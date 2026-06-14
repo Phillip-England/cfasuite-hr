@@ -204,6 +204,40 @@ func TestEmployeeWagesAreAssignedByEmployeeNumber(t *testing.T) {
 	}
 }
 
+func TestEmployeeLaborExclusionPersistsForLocation(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employees, err := listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	if _, err := assignEmployeeLaborExclusion(db, locationID, []int64{employees[0].ID}, true); err != nil {
+		t.Fatalf("assignEmployeeLaborExclusion: %v", err)
+	}
+	employees, err = listEmployees(db, locationID)
+	if err != nil {
+		t.Fatalf("listEmployees after exclusion: %v", err)
+	}
+	if len(employees) != 1 || !employees[0].ExcludeFromLabor {
+		t.Fatalf("expected labor exclusion to persist, got %#v", employees)
+	}
+}
+
 func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {

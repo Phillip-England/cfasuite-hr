@@ -2794,11 +2794,12 @@ const locationShowHTML = `{{define "body"}}
       const row = form.closest('tr');
       const assignment = form.querySelector('input[name="assignment"]').value;
       const previousValue = select.dataset.previousValue || '';
+      const data = new FormData(form);
       select.disabled = true;
       try {
         const response = await fetch(form.action, {
           method: 'POST',
-          body: new FormData(form),
+          body: data,
           headers: {'X-Requested-With': 'fetch'},
         });
         if (!response.ok) throw new Error(await response.text());

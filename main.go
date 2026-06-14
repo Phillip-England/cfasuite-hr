@@ -1416,11 +1416,18 @@ func assignEmployeeRole(db *sql.DB, locationID int64, employeeIDs []int64, roleI
 	defer tx.Rollback()
 	updated := 0
 	for _, employeeID := range employeeIDs {
+		var employeeNumber string
+		if err := tx.QueryRow(`SELECT employee_number FROM employees WHERE location_id = ? AND id = ?`, locationID, employeeID).Scan(&employeeNumber); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return 0, err
+		}
 		var res sql.Result
 		if roleID == nil {
-			res, err = tx.Exec(`UPDATE employees SET role_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, employeeID)
+			res, err = tx.Exec(`UPDATE employees SET role_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, employeeNumber)
 		} else {
-			res, err = tx.Exec(`UPDATE employees SET role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, *roleID, locationID, employeeID)
+			res, err = tx.Exec(`UPDATE employees SET role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, *roleID, employeeNumber)
 		}
 		if err != nil {
 			return 0, err
@@ -1439,11 +1446,18 @@ func assignEmployeeDepartment(db *sql.DB, locationID int64, employeeIDs []int64,
 	defer tx.Rollback()
 	updated := 0
 	for _, employeeID := range employeeIDs {
+		var employeeNumber string
+		if err := tx.QueryRow(`SELECT employee_number FROM employees WHERE location_id = ? AND id = ?`, locationID, employeeID).Scan(&employeeNumber); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return 0, err
+		}
 		var res sql.Result
 		if departmentID == nil {
-			res, err = tx.Exec(`UPDATE employees SET department_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, employeeID)
+			res, err = tx.Exec(`UPDATE employees SET department_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, employeeNumber)
 		} else {
-			res, err = tx.Exec(`UPDATE employees SET department_id = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, *departmentID, locationID, employeeID)
+			res, err = tx.Exec(`UPDATE employees SET department_id = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, *departmentID, employeeNumber)
 		}
 		if err != nil {
 			return 0, err
@@ -1518,6 +1532,30 @@ func scanEmployee(row scanner) (Employee, error) {
 	return e, err
 }
 
+func employeeAssignmentForNumber(tx *sql.Tx, employeeNumber string) (any, any, error) {
+	var roleID sql.NullInt64
+	var departmentID sql.NullInt64
+	err := tx.QueryRow(`SELECT role_id, department_id FROM employees
+		WHERE employee_number = ? AND (role_id IS NOT NULL OR department_id IS NOT NULL)
+		ORDER BY updated_at DESC, id DESC
+		LIMIT 1`, employeeNumber).Scan(&roleID, &departmentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var role any
+	var department any
+	if roleID.Valid {
+		role = roleID.Int64
+	}
+	if departmentID.Valid {
+		department = departmentID.Int64
+	}
+	return role, department, nil
+}
+
 func importBio(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
 	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".xlsx") {
 		return ImportResult{}, errors.New("employee bio must be an .xlsx file")
@@ -1547,8 +1585,12 @@ func importBio(db *sql.DB, locationID int64, file multipart.File, header *multip
 		err := tx.QueryRow(`SELECT id FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, employee.Number).Scan(&existingID)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
-				VALUES (?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, "Active", employee.LatestStartDate)
+			roleID, departmentID, err := employeeAssignmentForNumber(tx, employee.Number)
+			if err != nil {
+				return ImportResult{}, err
+			}
+			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, department_id, employee_status, location_latest_start_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, roleID, departmentID, "Active", employee.LatestStartDate)
 			if err != nil {
 				return ImportResult{}, err
 			}

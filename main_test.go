@@ -157,6 +157,117 @@ func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
 	}
 }
 
+func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("create first location: %v", err)
+	}
+	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	if err != nil {
+		t.Fatalf("create second location: %v", err)
+	}
+	roleID, err := createRole(db, "Trainer")
+	if err != nil {
+		t.Fatalf("createRole: %v", err)
+	}
+	departmentID, err := createDepartment(db, "Front of House")
+	if err != nil {
+		t.Fatalf("createDepartment: %v", err)
+	}
+	for _, locationID := range []int64{firstLocationID, secondLocationID} {
+		_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+			VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+		if err != nil {
+			t.Fatalf("insert employee: %v", err)
+		}
+	}
+	employees, err := listEmployees(db, firstLocationID)
+	if err != nil {
+		t.Fatalf("listEmployees: %v", err)
+	}
+	updated, err := assignEmployeeRole(db, firstLocationID, []int64{employees[0].ID}, &roleID)
+	if err != nil {
+		t.Fatalf("assignEmployeeRole: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("expected role assignment to update both location rows, got %d", updated)
+	}
+	updated, err = assignEmployeeDepartment(db, firstLocationID, []int64{employees[0].ID}, &departmentID)
+	if err != nil {
+		t.Fatalf("assignEmployeeDepartment: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("expected department assignment to update both location rows, got %d", updated)
+	}
+	for _, locationID := range []int64{firstLocationID, secondLocationID} {
+		employee, err := getEmployee(db, locationID, "12-1083836")
+		if err != nil {
+			t.Fatalf("getEmployee: %v", err)
+		}
+		if employee.RoleName == nil || *employee.RoleName != "Trainer" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
+			t.Fatalf("assignment did not propagate to location %d: %#v", locationID, employee)
+		}
+	}
+}
+
+func TestImportBioInheritsEmployeeAssignmentsByEmployeeNumber(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("create first location: %v", err)
+	}
+	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	if err != nil {
+		t.Fatalf("create second location: %v", err)
+	}
+	roleID, err := createRole(db, "Trainer")
+	if err != nil {
+		t.Fatalf("createRole: %v", err)
+	}
+	departmentID, err := createDepartment(db, "Front of House")
+	if err != nil {
+		t.Fatalf("createDepartment: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, department_id, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, firstLocationID, "Blanco, John", "12-1083836", "Team Member", roleID, departmentID, "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	data := birthdayWorkbook(t, [][]string{
+		{"Employee Name", "Employee Number", "Job", "Employee Status", "Location Latest Start Date"},
+		{"Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01"},
+	})
+	result, err := importBio(db, secondLocationID, multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "bio.xlsx"})
+	if err != nil {
+		t.Fatalf("importBio: %v", err)
+	}
+	if result.Added != 1 {
+		t.Fatalf("expected import to add employee, got %#v", result)
+	}
+	employee, err := getEmployee(db, secondLocationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.RoleName == nil || *employee.RoleName != "Trainer" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
+		t.Fatalf("imported employee did not inherit assignment: %#v", employee)
+	}
+}
+
 func TestImportBioPreservesRolesForRemainingEmployees(t *testing.T) {
 	data := birthdayWorkbook(t, [][]string{
 		{"Employee Name", "Employee Number", "Job", "Employee Status", "Location Latest Start Date"},

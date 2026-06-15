@@ -603,14 +603,18 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
 	mux.HandleFunc("POST /locations/{id}/assignments", a.requireAdmin(a.locationAssignmentsUpdate))
 	mux.HandleFunc("POST /locations/{id}/roles", a.requireAdmin(a.locationRolesUpdate))
+	mux.HandleFunc("GET /locations/{id}/roles", a.requireAdmin(a.rolesPage))
+	mux.HandleFunc("POST /locations/{id}/roles/manage", a.requireAdmin(a.roleCreate))
+	mux.HandleFunc("POST /locations/{locationID}/roles/{id}", a.requireAdmin(a.roleUpdate))
+	mux.HandleFunc("POST /locations/{locationID}/roles/{id}/delete", a.requireAdmin(a.roleDelete))
+	mux.HandleFunc("GET /locations/{id}/departments", a.requireAdmin(a.departmentsPage))
+	mux.HandleFunc("POST /locations/{id}/departments/manage", a.requireAdmin(a.departmentCreate))
+	mux.HandleFunc("POST /locations/{locationID}/departments/{id}", a.requireAdmin(a.departmentUpdate))
+	mux.HandleFunc("POST /locations/{locationID}/departments/{id}/delete", a.requireAdmin(a.departmentDelete))
 	mux.HandleFunc("GET /locations/{id}/labor", a.requireAdmin(a.laborPage))
 	mux.HandleFunc("POST /locations/{id}/labor", a.requireAdmin(a.laborUpload))
-	mux.HandleFunc("GET /roles", a.requireAdmin(a.rolesPage))
-	mux.HandleFunc("POST /roles", a.requireAdmin(a.roleCreate))
 	mux.HandleFunc("POST /roles/{id}", a.requireAdmin(a.roleUpdate))
 	mux.HandleFunc("POST /roles/{id}/delete", a.requireAdmin(a.roleDelete))
-	mux.HandleFunc("GET /departments", a.requireAdmin(a.departmentsPage))
-	mux.HandleFunc("POST /departments", a.requireAdmin(a.departmentCreate))
 	mux.HandleFunc("POST /departments/{id}", a.requireAdmin(a.departmentUpdate))
 	mux.HandleFunc("POST /departments/{id}/delete", a.requireAdmin(a.departmentDelete))
 	mux.HandleFunc("GET /tokens", a.requireAdmin(a.tokensPage))
@@ -1142,30 +1146,32 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) rolesPage(w http.ResponseWriter, r *http.Request) {
-	locations, selected, err := catalogLocation(a.db, r)
+	locationID, err := pathID(r, "id")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
-	var roles []Role
-	if selected.ID != 0 {
-		roles, err = listRoles(a.db, selected.ID)
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
 	}
+	roles, err := listRoles(a.db, locationID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "Roles", rolesHTML, map[string]any{"Roles": roles, "Locations": locations, "SelectedLocation": selected})
+	a.render(w, loc.Name+" Roles", rolesHTML, map[string]any{"Roles": roles, "SelectedLocation": loc})
 }
 
 func (a *App) roleCreate(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	locationID, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
 		return
 	}
-	locationID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("location_id")), 10, 64)
-	if err != nil {
-		http.Error(w, "location is required", http.StatusBadRequest)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if _, err := getLocation(a.db, locationID); err != nil {
@@ -1176,7 +1182,7 @@ func (a *App) roleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", locationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/roles", locationID), http.StatusSeeOther)
 }
 
 func (a *App) roleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1198,7 +1204,7 @@ func (a *App) roleUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", role.LocationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/roles", role.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) roleDelete(w http.ResponseWriter, r *http.Request) {
@@ -1216,34 +1222,36 @@ func (a *App) roleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", role.LocationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/roles", role.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentsPage(w http.ResponseWriter, r *http.Request) {
-	locations, selected, err := catalogLocation(a.db, r)
+	locationID, err := pathID(r, "id")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.NotFound(w, r)
 		return
 	}
-	var departments []Department
-	if selected.ID != 0 {
-		departments, err = listDepartments(a.db, selected.ID)
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
 	}
+	departments, err := listDepartments(a.db, locationID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "Departments", departmentsHTML, map[string]any{"Departments": departments, "Locations": locations, "SelectedLocation": selected})
+	a.render(w, loc.Name+" Departments", departmentsHTML, map[string]any{"Departments": departments, "SelectedLocation": loc})
 }
 
 func (a *App) departmentCreate(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	locationID, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
 		return
 	}
-	locationID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("location_id")), 10, 64)
-	if err != nil {
-		http.Error(w, "location is required", http.StatusBadRequest)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if _, err := getLocation(a.db, locationID); err != nil {
@@ -1254,7 +1262,7 @@ func (a *App) departmentCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", locationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/departments", locationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1276,7 +1284,7 @@ func (a *App) departmentUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", department.LocationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/departments", department.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentDelete(w http.ResponseWriter, r *http.Request) {
@@ -1294,7 +1302,7 @@ func (a *App) departmentDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", department.LocationID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/departments", department.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -1541,29 +1549,6 @@ func getLocationByNumber(db *sql.DB, number string) (Location, error) {
 	loc.CreatedAt = parseTime(created)
 	loc.UpdatedAt = parseTime(updated)
 	return loc, err
-}
-
-func catalogLocation(db *sql.DB, r *http.Request) ([]Location, Location, error) {
-	locations, err := listLocations(db)
-	if err != nil {
-		return nil, Location{}, err
-	}
-	if len(locations) == 0 {
-		return locations, Location{}, nil
-	}
-	locationID := locations[0].ID
-	if raw := strings.TrimSpace(r.URL.Query().Get("location_id")); raw != "" {
-		locationID, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return nil, Location{}, errors.New("invalid location")
-		}
-	}
-	for _, loc := range locations {
-		if loc.ID == locationID {
-			return locations, loc, nil
-		}
-	}
-	return nil, Location{}, errors.New("location not found")
 }
 
 func listRoles(db *sql.DB, locationID int64) ([]Role, error) {
@@ -3233,8 +3218,6 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
     <a class="brand" href="/">cfasuite-hr</a>
     {{if not .LoggedOut}}<nav>
       <a href="/">Locations</a>
-      <a href="/roles">Roles</a>
-      <a href="/departments">Departments</a>
       <a href="/tokens">API Tokens</a>
       <a href="/docs">API Docs</a>
       <form method="post" action="/logout"><button class="ghost">Sign out</button></form>
@@ -3269,8 +3252,6 @@ const dashboardHTML = `{{define "body"}}
     <p class="muted">Store {{.Number}}</p>
     <p>{{.Employees}} active employees</p>
     <a class="button secondary" href="/locations/{{.ID}}">Manage</a>
-    <a class="button secondary" href="/roles?location_id={{.ID}}">Roles</a>
-    <a class="button secondary" href="/departments?location_id={{.ID}}">Departments</a>
   </article>
 {{else}}
   <p class="empty">No locations yet.</p>
@@ -3302,6 +3283,8 @@ const locationShowHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 <section class="overview-grid">
   <article class="metric">
@@ -3449,6 +3432,8 @@ const locationDetailsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 <section class="overview-grid">
   <article class="metric">
@@ -3567,6 +3552,8 @@ const locationDocumentsHTML = `{{define "body"}}
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 {{if .Import.Get "added"}}<p class="notice">Employee bio imported for {{.Location.Name}}. Added {{.Import.Get "added"}}, updated {{.Import.Get "updated"}}, removed {{.Import.Get "removed"}}, skipped {{.Import.Get "skipped"}}.</p>{{end}}
 {{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported for {{.Location.Name}}. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees at this location.</p>{{end}}
@@ -3599,6 +3586,8 @@ const locationEditHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 {{if .Saved}}<p class="notice">Location saved.</p>{{end}}
 <section class="split">
@@ -3629,6 +3618,8 @@ const laborHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
 </nav>
 <form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
   <label>Time punch report
@@ -3747,18 +3738,22 @@ const laborHTML = `{{define "body"}}
 {{end}}`
 
 const rolesHTML = `{{define "body"}}
-<div class="row"><h1>Roles</h1></div>
-{{if .Locations}}
-<form method="get" action="/roles" class="panel inline">
-  <label>Location
-    <select name="location_id" onchange="this.form.submit()">
-      {{range .Locations}}<option value="{{.ID}}" {{if eq $.SelectedLocation.ID .ID}}selected{{end}}>{{.Name}} ({{.Number}})</option>{{end}}
-    </select>
-  </label>
-  <button class="secondary">View</button>
-</form>
-<form method="post" action="/roles" class="panel inline">
-  <input type="hidden" name="location_id" value="{{.SelectedLocation.ID}}">
+<div class="row">
+  <div>
+    <h1>{{.SelectedLocation.Name}} Roles</h1>
+    <p class="muted">Store {{.SelectedLocation.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
+  <a class="active" href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
+</nav>
+<form method="post" action="/locations/{{.SelectedLocation.ID}}/roles/manage" class="panel inline">
   <label>Role name <input name="name" placeholder="Team Leader" required></label>
   <button>Create role</button>
 </form>
@@ -3768,38 +3763,39 @@ const rolesHTML = `{{define "body"}}
   {{range .Roles}}
     <tr>
       <td>
-        <form method="post" action="/roles/{{.ID}}" class="inline table-form">
+        <form method="post" action="/locations/{{$.SelectedLocation.ID}}/roles/{{.ID}}" class="inline table-form">
           <label class="sr-only">Role name</label>
           <input name="name" value="{{.Name}}" required>
           <button class="small secondary">Save</button>
         </form>
       </td>
       <td>{{.Employees}}</td>
-      <td><form method="post" action="/roles/{{.ID}}/delete" onsubmit="return confirm('Delete this role and clear it from assigned employees?')"><button class="danger small">Delete</button></form></td>
+      <td><form method="post" action="/locations/{{$.SelectedLocation.ID}}/roles/{{.ID}}/delete" onsubmit="return confirm('Delete this role and clear it from assigned employees?')"><button class="danger small">Delete</button></form></td>
     </tr>
   {{else}}
     <tr><td colspan="3">No roles created.</td></tr>
   {{end}}
   </tbody>
 </table>
-{{else}}
-<p class="empty">Create a location before adding roles.</p>
-{{end}}
 {{end}}`
 
 const departmentsHTML = `{{define "body"}}
-<div class="row"><h1>Departments</h1></div>
-{{if .Locations}}
-<form method="get" action="/departments" class="panel inline">
-  <label>Location
-    <select name="location_id" onchange="this.form.submit()">
-      {{range .Locations}}<option value="{{.ID}}" {{if eq $.SelectedLocation.ID .ID}}selected{{end}}>{{.Name}} ({{.Number}})</option>{{end}}
-    </select>
-  </label>
-  <button class="secondary">View</button>
-</form>
-<form method="post" action="/departments" class="panel inline">
-  <input type="hidden" name="location_id" value="{{.SelectedLocation.ID}}">
+<div class="row">
+  <div>
+    <h1>{{.SelectedLocation.Name}} Departments</h1>
+    <p class="muted">Store {{.SelectedLocation.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a class="active" href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
+</nav>
+<form method="post" action="/locations/{{.SelectedLocation.ID}}/departments/manage" class="panel inline">
   <label>Department name <input name="name" placeholder="Front of House" required></label>
   <button>Create department</button>
 </form>
@@ -3809,23 +3805,20 @@ const departmentsHTML = `{{define "body"}}
   {{range .Departments}}
     <tr>
       <td>
-        <form method="post" action="/departments/{{.ID}}" class="inline table-form">
+        <form method="post" action="/locations/{{$.SelectedLocation.ID}}/departments/{{.ID}}" class="inline table-form">
           <label class="sr-only">Department name</label>
           <input name="name" value="{{.Name}}" required>
           <button class="small secondary">Save</button>
         </form>
       </td>
       <td>{{.Employees}}</td>
-      <td><form method="post" action="/departments/{{.ID}}/delete" onsubmit="return confirm('Delete this department and clear it from assigned employees?')"><button class="danger small">Delete</button></form></td>
+      <td><form method="post" action="/locations/{{$.SelectedLocation.ID}}/departments/{{.ID}}/delete" onsubmit="return confirm('Delete this department and clear it from assigned employees?')"><button class="danger small">Delete</button></form></td>
     </tr>
   {{else}}
     <tr><td colspan="3">No departments created.</td></tr>
   {{end}}
   </tbody>
 </table>
-{{else}}
-<p class="empty">Create a location before adding departments.</p>
-{{end}}
 {{end}}`
 
 const tokensHTML = `{{define "body"}}

@@ -100,19 +100,21 @@ type AssignmentStatus struct {
 }
 
 type Role struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Employees int       `json:"employee_count,omitempty"`
+	ID         int64     `json:"id"`
+	LocationID int64     `json:"location_id"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Employees  int       `json:"employee_count,omitempty"`
 }
 
 type Department struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Employees int       `json:"employee_count,omitempty"`
+	ID         int64     `json:"id"`
+	LocationID int64     `json:"location_id"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Employees  int       `json:"employee_count,omitempty"`
 }
 
 type Token struct {
@@ -240,6 +242,7 @@ Usage:
   cfasuite-hr serve [-addr :8217] [-db data/cfasuite-hr.db]
   cfasuite-hr init [-db data/cfasuite-hr.db]
   cfasuite-hr db path [-db data/cfasuite-hr.db]
+  cfasuite-hr db reset -yes [-db data/cfasuite-hr.db]
   cfasuite-hr set-admin -username admin -password secret [-db data/cfasuite-hr.db]
   cfasuite-hr admin-env -username admin -password secret
   cfasuite-hr token create -name "Reporting" [-db data/cfasuite-hr.db]
@@ -284,14 +287,39 @@ func cmdInit(args []string) {
 }
 
 func cmdDB(args []string) {
-	if len(args) == 0 || args[0] != "path" {
-		fmt.Fprintln(os.Stderr, "usage: cfasuite-hr db path [-db data/cfasuite-hr.db]")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: cfasuite-hr db path|reset")
 		os.Exit(2)
 	}
-	fs := flag.NewFlagSet("db path", flag.ExitOnError)
-	dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
-	fs.Parse(args[1:])
-	fmt.Println(abs(*dbPath))
+	switch args[0] {
+	case "path":
+		fs := flag.NewFlagSet("db path", flag.ExitOnError)
+		dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+		fs.Parse(args[1:])
+		fmt.Println(abs(*dbPath))
+	case "reset":
+		fs := flag.NewFlagSet("db reset", flag.ExitOnError)
+		dbPath := fs.String("db", env("CFASUITE_DB_PATH", defaultDBPath), "SQLite database path")
+		yes := fs.Bool("yes", false, "confirm database deletion")
+		fs.Parse(args[1:])
+		if !*yes {
+			must(errors.New("db reset deletes all application data; rerun with -yes to confirm"))
+		}
+		path := abs(*dbPath)
+		for _, removePath := range []string{path, path + "-wal", path + "-shm"} {
+			if err := os.Remove(removePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				must(err)
+			}
+		}
+		db, err := openDB(path)
+		must(err)
+		defer db.Close()
+		must(migrate(db))
+		fmt.Printf("reset database: %s\n", path)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown db command: %s\n", args[0])
+		os.Exit(2)
+	}
 }
 
 func cmdSetAdmin(args []string) {
@@ -425,15 +453,19 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS roles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL UNIQUE,
+			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(location_id, name)
 		)`,
 		`CREATE TABLE IF NOT EXISTS departments (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL UNIQUE,
+			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(location_id, name)
 		)`,
 		`CREATE TABLE IF NOT EXISTS employees (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -670,12 +702,12 @@ func (a *App) locationShow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	roles, err := listRoles(a.db)
+	roles, err := listRoles(a.db, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	departments, err := listDepartments(a.db)
+	departments, err := listDepartments(a.db, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -965,7 +997,7 @@ func (a *App) updateEmployeeRoleAssignments(w http.ResponseWriter, r *http.Reque
 			http.Error(w, "invalid role", http.StatusBadRequest)
 			return
 		}
-		if _, err := getRole(a.db, parsed); err != nil {
+		if _, err := getRole(a.db, id, parsed); err != nil {
 			http.Error(w, "role not found", http.StatusBadRequest)
 			return
 		}
@@ -1017,7 +1049,7 @@ func (a *App) updateEmployeeDepartmentAssignments(w http.ResponseWriter, r *http
 			http.Error(w, "invalid department", http.StatusBadRequest)
 			return
 		}
-		if _, err := getDepartment(a.db, parsed); err != nil {
+		if _, err := getDepartment(a.db, id, parsed); err != nil {
 			http.Error(w, "department not found", http.StatusBadRequest)
 			return
 		}
@@ -1110,12 +1142,20 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) rolesPage(w http.ResponseWriter, r *http.Request) {
-	roles, err := listRoles(a.db)
+	locations, selected, err := catalogLocation(a.db, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var roles []Role
+	if selected.ID != 0 {
+		roles, err = listRoles(a.db, selected.ID)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "Roles", rolesHTML, map[string]any{"Roles": roles})
+	a.render(w, "Roles", rolesHTML, map[string]any{"Roles": roles, "Locations": locations, "SelectedLocation": selected})
 }
 
 func (a *App) roleCreate(w http.ResponseWriter, r *http.Request) {
@@ -1123,11 +1163,20 @@ func (a *App) roleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err := createRole(a.db, r.FormValue("name")); err != nil {
+	locationID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("location_id")), 10, 64)
+	if err != nil {
+		http.Error(w, "location is required", http.StatusBadRequest)
+		return
+	}
+	if _, err := getLocation(a.db, locationID); err != nil {
+		http.Error(w, "location not found", http.StatusBadRequest)
+		return
+	}
+	if _, err := createRole(a.db, locationID, r.FormValue("name")); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", locationID), http.StatusSeeOther)
 }
 
 func (a *App) roleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1140,11 +1189,16 @@ func (a *App) roleUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	role, err := getRoleByID(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	if err := updateRole(a.db, id, r.FormValue("name")); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", role.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) roleDelete(w http.ResponseWriter, r *http.Request) {
@@ -1153,20 +1207,33 @@ func (a *App) roleDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	role, err := getRoleByID(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	if _, err := a.db.Exec(`DELETE FROM roles WHERE id = ?`, id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/roles", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/roles?location_id=%d", role.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentsPage(w http.ResponseWriter, r *http.Request) {
-	departments, err := listDepartments(a.db)
+	locations, selected, err := catalogLocation(a.db, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var departments []Department
+	if selected.ID != 0 {
+		departments, err = listDepartments(a.db, selected.ID)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.render(w, "Departments", departmentsHTML, map[string]any{"Departments": departments})
+	a.render(w, "Departments", departmentsHTML, map[string]any{"Departments": departments, "Locations": locations, "SelectedLocation": selected})
 }
 
 func (a *App) departmentCreate(w http.ResponseWriter, r *http.Request) {
@@ -1174,11 +1241,20 @@ func (a *App) departmentCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err := createDepartment(a.db, r.FormValue("name")); err != nil {
+	locationID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("location_id")), 10, 64)
+	if err != nil {
+		http.Error(w, "location is required", http.StatusBadRequest)
+		return
+	}
+	if _, err := getLocation(a.db, locationID); err != nil {
+		http.Error(w, "location not found", http.StatusBadRequest)
+		return
+	}
+	if _, err := createDepartment(a.db, locationID, r.FormValue("name")); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/departments", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", locationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1191,11 +1267,16 @@ func (a *App) departmentUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	department, err := getDepartmentByID(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	if err := updateDepartment(a.db, id, r.FormValue("name")); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/departments", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", department.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) departmentDelete(w http.ResponseWriter, r *http.Request) {
@@ -1204,11 +1285,16 @@ func (a *App) departmentDelete(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	department, err := getDepartmentByID(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
 	if _, err := a.db.Exec(`DELETE FROM departments WHERE id = ?`, id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/departments", http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/departments?location_id=%d", department.LocationID), http.StatusSeeOther)
 }
 
 func (a *App) tokensPage(w http.ResponseWriter, r *http.Request) {
@@ -1457,12 +1543,36 @@ func getLocationByNumber(db *sql.DB, number string) (Location, error) {
 	return loc, err
 }
 
-func listRoles(db *sql.DB) ([]Role, error) {
-	rows, err := db.Query(`SELECT r.id, r.name, r.created_at, r.updated_at, COUNT(e.id)
+func catalogLocation(db *sql.DB, r *http.Request) ([]Location, Location, error) {
+	locations, err := listLocations(db)
+	if err != nil {
+		return nil, Location{}, err
+	}
+	if len(locations) == 0 {
+		return locations, Location{}, nil
+	}
+	locationID := locations[0].ID
+	if raw := strings.TrimSpace(r.URL.Query().Get("location_id")); raw != "" {
+		locationID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, Location{}, errors.New("invalid location")
+		}
+	}
+	for _, loc := range locations {
+		if loc.ID == locationID {
+			return locations, loc, nil
+		}
+	}
+	return nil, Location{}, errors.New("location not found")
+}
+
+func listRoles(db *sql.DB, locationID int64) ([]Role, error) {
+	rows, err := db.Query(`SELECT r.id, r.location_id, r.name, r.created_at, r.updated_at, COUNT(e.id)
 		FROM roles r
 		LEFT JOIN employees e ON e.role_id = r.id
+		WHERE r.location_id = ?
 		GROUP BY r.id
-		ORDER BY r.name`)
+		ORDER BY r.name`, locationID)
 	if err != nil {
 		return nil, err
 	}
@@ -1471,7 +1581,7 @@ func listRoles(db *sql.DB) ([]Role, error) {
 	for rows.Next() {
 		var role Role
 		var created, updated string
-		if err := rows.Scan(&role.ID, &role.Name, &created, &updated, &role.Employees); err != nil {
+		if err := rows.Scan(&role.ID, &role.LocationID, &role.Name, &created, &updated, &role.Employees); err != nil {
 			return nil, err
 		}
 		role.CreatedAt = parseTime(created)
@@ -1481,12 +1591,12 @@ func listRoles(db *sql.DB) ([]Role, error) {
 	return roles, rows.Err()
 }
 
-func createRole(db *sql.DB, name string) (int64, error) {
+func createRole(db *sql.DB, locationID int64, name string) (int64, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return 0, errors.New("role name is required")
 	}
-	res, err := db.Exec(`INSERT INTO roles (name) VALUES (?)`, name)
+	res, err := db.Exec(`INSERT INTO roles (location_id, name) VALUES (?, ?)`, locationID, name)
 	if err != nil {
 		return 0, err
 	}
@@ -1502,21 +1612,31 @@ func updateRole(db *sql.DB, id int64, name string) error {
 	return err
 }
 
-func getRole(db *sql.DB, id int64) (Role, error) {
+func getRole(db *sql.DB, locationID, id int64) (Role, error) {
 	var role Role
 	var created, updated string
-	err := db.QueryRow(`SELECT id, name, created_at, updated_at FROM roles WHERE id = ?`, id).Scan(&role.ID, &role.Name, &created, &updated)
+	err := db.QueryRow(`SELECT id, location_id, name, created_at, updated_at FROM roles WHERE location_id = ? AND id = ?`, locationID, id).Scan(&role.ID, &role.LocationID, &role.Name, &created, &updated)
 	role.CreatedAt = parseTime(created)
 	role.UpdatedAt = parseTime(updated)
 	return role, err
 }
 
-func listDepartments(db *sql.DB) ([]Department, error) {
-	rows, err := db.Query(`SELECT d.id, d.name, d.created_at, d.updated_at, COUNT(e.id)
+func getRoleByID(db *sql.DB, id int64) (Role, error) {
+	var role Role
+	var created, updated string
+	err := db.QueryRow(`SELECT id, location_id, name, created_at, updated_at FROM roles WHERE id = ?`, id).Scan(&role.ID, &role.LocationID, &role.Name, &created, &updated)
+	role.CreatedAt = parseTime(created)
+	role.UpdatedAt = parseTime(updated)
+	return role, err
+}
+
+func listDepartments(db *sql.DB, locationID int64) ([]Department, error) {
+	rows, err := db.Query(`SELECT d.id, d.location_id, d.name, d.created_at, d.updated_at, COUNT(e.id)
 		FROM departments d
 		LEFT JOIN employees e ON e.department_id = d.id
+		WHERE d.location_id = ?
 		GROUP BY d.id
-		ORDER BY d.name`)
+		ORDER BY d.name`, locationID)
 	if err != nil {
 		return nil, err
 	}
@@ -1525,7 +1645,7 @@ func listDepartments(db *sql.DB) ([]Department, error) {
 	for rows.Next() {
 		var department Department
 		var created, updated string
-		if err := rows.Scan(&department.ID, &department.Name, &created, &updated, &department.Employees); err != nil {
+		if err := rows.Scan(&department.ID, &department.LocationID, &department.Name, &created, &updated, &department.Employees); err != nil {
 			return nil, err
 		}
 		department.CreatedAt = parseTime(created)
@@ -1535,12 +1655,12 @@ func listDepartments(db *sql.DB) ([]Department, error) {
 	return departments, rows.Err()
 }
 
-func createDepartment(db *sql.DB, name string) (int64, error) {
+func createDepartment(db *sql.DB, locationID int64, name string) (int64, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return 0, errors.New("department name is required")
 	}
-	res, err := db.Exec(`INSERT INTO departments (name) VALUES (?)`, name)
+	res, err := db.Exec(`INSERT INTO departments (location_id, name) VALUES (?, ?)`, locationID, name)
 	if err != nil {
 		return 0, err
 	}
@@ -1556,10 +1676,19 @@ func updateDepartment(db *sql.DB, id int64, name string) error {
 	return err
 }
 
-func getDepartment(db *sql.DB, id int64) (Department, error) {
+func getDepartment(db *sql.DB, locationID, id int64) (Department, error) {
 	var department Department
 	var created, updated string
-	err := db.QueryRow(`SELECT id, name, created_at, updated_at FROM departments WHERE id = ?`, id).Scan(&department.ID, &department.Name, &created, &updated)
+	err := db.QueryRow(`SELECT id, location_id, name, created_at, updated_at FROM departments WHERE location_id = ? AND id = ?`, locationID, id).Scan(&department.ID, &department.LocationID, &department.Name, &created, &updated)
+	department.CreatedAt = parseTime(created)
+	department.UpdatedAt = parseTime(updated)
+	return department, err
+}
+
+func getDepartmentByID(db *sql.DB, id int64) (Department, error) {
+	var department Department
+	var created, updated string
+	err := db.QueryRow(`SELECT id, location_id, name, created_at, updated_at FROM departments WHERE id = ?`, id).Scan(&department.ID, &department.LocationID, &department.Name, &created, &updated)
 	department.CreatedAt = parseTime(created)
 	department.UpdatedAt = parseTime(updated)
 	return department, err
@@ -1573,18 +1702,11 @@ func assignEmployeeRole(db *sql.DB, locationID int64, employeeIDs []int64, roleI
 	defer tx.Rollback()
 	updated := 0
 	for _, employeeID := range employeeIDs {
-		var employeeNumber string
-		if err := tx.QueryRow(`SELECT employee_number FROM employees WHERE location_id = ? AND id = ?`, locationID, employeeID).Scan(&employeeNumber); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return 0, err
-		}
 		var res sql.Result
 		if roleID == nil {
-			res, err = tx.Exec(`UPDATE employees SET role_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, employeeNumber)
+			res, err = tx.Exec(`UPDATE employees SET role_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, employeeID)
 		} else {
-			res, err = tx.Exec(`UPDATE employees SET role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, *roleID, employeeNumber)
+			res, err = tx.Exec(`UPDATE employees SET role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, *roleID, locationID, employeeID)
 		}
 		if err != nil {
 			return 0, err
@@ -1603,18 +1725,11 @@ func assignEmployeeDepartment(db *sql.DB, locationID int64, employeeIDs []int64,
 	defer tx.Rollback()
 	updated := 0
 	for _, employeeID := range employeeIDs {
-		var employeeNumber string
-		if err := tx.QueryRow(`SELECT employee_number FROM employees WHERE location_id = ? AND id = ?`, locationID, employeeID).Scan(&employeeNumber); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return 0, err
-		}
 		var res sql.Result
 		if departmentID == nil {
-			res, err = tx.Exec(`UPDATE employees SET department_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, employeeNumber)
+			res, err = tx.Exec(`UPDATE employees SET department_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, employeeID)
 		} else {
-			res, err = tx.Exec(`UPDATE employees SET department_id = ?, updated_at = CURRENT_TIMESTAMP WHERE employee_number = ?`, *departmentID, employeeNumber)
+			res, err = tx.Exec(`UPDATE employees SET department_id = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, *departmentID, locationID, employeeID)
 		}
 		if err != nil {
 			return 0, err
@@ -1746,37 +1861,27 @@ func scanEmployee(row scanner) (Employee, error) {
 	return e, err
 }
 
-func employeeAssignmentForNumber(tx *sql.Tx, employeeNumber string) (any, any, any, string, error) {
-	var roleID sql.NullInt64
-	var departmentID sql.NullInt64
+func employeeWageForNumber(tx *sql.Tx, employeeNumber string) (any, string, error) {
 	var wageRateCents sql.NullInt64
 	var wagePayType sql.NullString
-	err := tx.QueryRow(`SELECT role_id, department_id, wage_rate_cents, wage_pay_type FROM employees
-		WHERE employee_number = ? AND (role_id IS NOT NULL OR department_id IS NOT NULL OR wage_rate_cents IS NOT NULL OR wage_pay_type != '')
+	err := tx.QueryRow(`SELECT wage_rate_cents, wage_pay_type FROM employees
+		WHERE employee_number = ? AND (wage_rate_cents IS NOT NULL OR wage_pay_type != '')
 		ORDER BY updated_at DESC, id DESC
-		LIMIT 1`, employeeNumber).Scan(&roleID, &departmentID, &wageRateCents, &wagePayType)
+		LIMIT 1`, employeeNumber).Scan(&wageRateCents, &wagePayType)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, nil, "", nil
+		return nil, "", nil
 	}
 	if err != nil {
-		return nil, nil, nil, "", err
+		return nil, "", err
 	}
-	var role any
-	var department any
 	var wage any
-	if roleID.Valid {
-		role = roleID.Int64
-	}
-	if departmentID.Valid {
-		department = departmentID.Int64
-	}
 	if wageRateCents.Valid {
 		wage = wageRateCents.Int64
 	}
 	if wagePayType.Valid {
-		return role, department, wage, wagePayType.String, nil
+		return wage, wagePayType.String, nil
 	}
-	return role, department, wage, "", nil
+	return wage, "", nil
 }
 
 func importBio(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
@@ -1808,12 +1913,12 @@ func importBio(db *sql.DB, locationID int64, file multipart.File, header *multip
 		err := tx.QueryRow(`SELECT id FROM employees WHERE location_id = ? AND employee_number = ?`, locationID, employee.Number).Scan(&existingID)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			roleID, departmentID, wageRateCents, wagePayType, err := employeeAssignmentForNumber(tx, employee.Number)
+			wageRateCents, wagePayType, err := employeeWageForNumber(tx, employee.Number)
 			if err != nil {
 				return ImportResult{}, err
 			}
-			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, role_id, department_id, wage_rate_cents, wage_pay_type, employee_status, location_latest_start_date)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, roleID, departmentID, wageRateCents, wagePayType, "Active", employee.LatestStartDate)
+			_, err = tx.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, wage_rate_cents, wage_pay_type, employee_status, location_latest_start_date)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, locationID, employee.Name, employee.Number, employee.Job, wageRateCents, wagePayType, "Active", employee.LatestStartDate)
 			if err != nil {
 				return ImportResult{}, err
 			}
@@ -2844,7 +2949,7 @@ Base URL: %s
 Purpose:
 cfasuite-hr exposes Chick-fil-A restaurant locations and active employee records to other systems.
 Employee records come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files.
-Jobs come from the employee bio. Roles and departments are configured inside cfasuite-hr by the admin and assigned manually.
+Jobs come from the employee bio. Roles and departments are configured per location inside cfasuite-hr by the admin and assigned manually.
 
 Authentication:
 Send an API token with either header:
@@ -3164,6 +3269,8 @@ const dashboardHTML = `{{define "body"}}
     <p class="muted">Store {{.Number}}</p>
     <p>{{.Employees}} active employees</p>
     <a class="button secondary" href="/locations/{{.ID}}">Manage</a>
+    <a class="button secondary" href="/roles?location_id={{.ID}}">Roles</a>
+    <a class="button secondary" href="/departments?location_id={{.ID}}">Departments</a>
   </article>
 {{else}}
   <p class="empty">No locations yet.</p>
@@ -3641,7 +3748,17 @@ const laborHTML = `{{define "body"}}
 
 const rolesHTML = `{{define "body"}}
 <div class="row"><h1>Roles</h1></div>
+{{if .Locations}}
+<form method="get" action="/roles" class="panel inline">
+  <label>Location
+    <select name="location_id" onchange="this.form.submit()">
+      {{range .Locations}}<option value="{{.ID}}" {{if eq $.SelectedLocation.ID .ID}}selected{{end}}>{{.Name}} ({{.Number}})</option>{{end}}
+    </select>
+  </label>
+  <button class="secondary">View</button>
+</form>
 <form method="post" action="/roles" class="panel inline">
+  <input type="hidden" name="location_id" value="{{.SelectedLocation.ID}}">
   <label>Role name <input name="name" placeholder="Team Leader" required></label>
   <button>Create role</button>
 </form>
@@ -3665,11 +3782,24 @@ const rolesHTML = `{{define "body"}}
   {{end}}
   </tbody>
 </table>
+{{else}}
+<p class="empty">Create a location before adding roles.</p>
+{{end}}
 {{end}}`
 
 const departmentsHTML = `{{define "body"}}
 <div class="row"><h1>Departments</h1></div>
+{{if .Locations}}
+<form method="get" action="/departments" class="panel inline">
+  <label>Location
+    <select name="location_id" onchange="this.form.submit()">
+      {{range .Locations}}<option value="{{.ID}}" {{if eq $.SelectedLocation.ID .ID}}selected{{end}}>{{.Name}} ({{.Number}})</option>{{end}}
+    </select>
+  </label>
+  <button class="secondary">View</button>
+</form>
 <form method="post" action="/departments" class="panel inline">
+  <input type="hidden" name="location_id" value="{{.SelectedLocation.ID}}">
   <label>Department name <input name="name" placeholder="Front of House" required></label>
   <button>Create department</button>
 </form>
@@ -3693,6 +3823,9 @@ const departmentsHTML = `{{define "body"}}
   {{end}}
   </tbody>
 </table>
+{{else}}
+<p class="empty">Create a location before adding departments.</p>
+{{end}}
 {{end}}`
 
 const tokensHTML = `{{define "body"}}
@@ -3727,7 +3860,7 @@ const docsHTML = `{{define "body"}}
 </section>
 <section class="panel">
   <h2>Employee assignments</h2>
-  <p>Roles and departments are created by the admin in cfasuite-hr and assigned manually to employees. The imported <code>job</code> field remains separate from role and department assignments. Employees without an assignment return <code>null</code> for those fields.</p>
+  <p>Roles and departments are created per location by the admin in cfasuite-hr and assigned manually to employees. The imported <code>job</code> field remains separate from role and department assignments. Employees without an assignment return <code>null</code> for those fields.</p>
 </section>
 <section class="panel">
   <h2>Employee birthdays</h2>

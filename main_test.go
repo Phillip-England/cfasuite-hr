@@ -80,7 +80,7 @@ func TestEmployeeRolesAreAssignedSeparatelyFromJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
-	roleID, err := createRole(db, "Trainer")
+	roleID, err := createRole(db, locationID, "Trainer")
 	if err != nil {
 		t.Fatalf("createRole: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
-	departmentID, err := createDepartment(db, "Front of House")
+	departmentID, err := createDepartment(db, locationID, "Front of House")
 	if err != nil {
 		t.Fatalf("createDepartment: %v", err)
 	}
@@ -154,6 +154,51 @@ func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
 	}
 	if employee.Job != "Team Member" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
 		t.Fatalf("department assignment changed job or did not load department: %#v", employee)
+	}
+}
+
+func TestRoleAndDepartmentNamesCanRepeatAcrossLocations(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("create first location: %v", err)
+	}
+	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	if err != nil {
+		t.Fatalf("create second location: %v", err)
+	}
+	if _, err := createRole(db, firstLocationID, "Trainer"); err != nil {
+		t.Fatalf("create first role: %v", err)
+	}
+	if _, err := createRole(db, secondLocationID, "Trainer"); err != nil {
+		t.Fatalf("create second role: %v", err)
+	}
+	if _, err := createDepartment(db, firstLocationID, "Front of House"); err != nil {
+		t.Fatalf("create first department: %v", err)
+	}
+	if _, err := createDepartment(db, secondLocationID, "Front of House"); err != nil {
+		t.Fatalf("create second department: %v", err)
+	}
+	roles, err := listRoles(db, firstLocationID)
+	if err != nil {
+		t.Fatalf("listRoles: %v", err)
+	}
+	if len(roles) != 1 || roles[0].LocationID != firstLocationID || roles[0].Name != "Trainer" {
+		t.Fatalf("unexpected first location roles: %#v", roles)
+	}
+	departments, err := listDepartments(db, secondLocationID)
+	if err != nil {
+		t.Fatalf("listDepartments: %v", err)
+	}
+	if len(departments) != 1 || departments[0].LocationID != secondLocationID || departments[0].Name != "Front of House" {
+		t.Fatalf("unexpected second location departments: %#v", departments)
 	}
 }
 
@@ -238,7 +283,7 @@ func TestEmployeeLaborExclusionPersistsForLocation(t *testing.T) {
 	}
 }
 
-func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
+func TestEmployeeAssignmentsStayWithinLocation(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
@@ -255,11 +300,11 @@ func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
-	roleID, err := createRole(db, "Trainer")
+	roleID, err := createRole(db, firstLocationID, "Trainer")
 	if err != nil {
 		t.Fatalf("createRole: %v", err)
 	}
-	departmentID, err := createDepartment(db, "Front of House")
+	departmentID, err := createDepartment(db, firstLocationID, "Front of House")
 	if err != nil {
 		t.Fatalf("createDepartment: %v", err)
 	}
@@ -278,28 +323,33 @@ func TestEmployeeAssignmentsFollowEmployeeNumberAcrossLocations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assignEmployeeRole: %v", err)
 	}
-	if updated != 2 {
-		t.Fatalf("expected role assignment to update both location rows, got %d", updated)
+	if updated != 1 {
+		t.Fatalf("expected role assignment to update one location row, got %d", updated)
 	}
 	updated, err = assignEmployeeDepartment(db, firstLocationID, []int64{employees[0].ID}, &departmentID)
 	if err != nil {
 		t.Fatalf("assignEmployeeDepartment: %v", err)
 	}
-	if updated != 2 {
-		t.Fatalf("expected department assignment to update both location rows, got %d", updated)
+	if updated != 1 {
+		t.Fatalf("expected department assignment to update one location row, got %d", updated)
 	}
-	for _, locationID := range []int64{firstLocationID, secondLocationID} {
-		employee, err := getEmployee(db, locationID, "12-1083836")
-		if err != nil {
-			t.Fatalf("getEmployee: %v", err)
-		}
-		if employee.RoleName == nil || *employee.RoleName != "Trainer" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
-			t.Fatalf("assignment did not propagate to location %d: %#v", locationID, employee)
-		}
+	firstEmployee, err := getEmployee(db, firstLocationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("get first employee: %v", err)
+	}
+	if firstEmployee.RoleName == nil || *firstEmployee.RoleName != "Trainer" || firstEmployee.DepartmentName == nil || *firstEmployee.DepartmentName != "Front of House" {
+		t.Fatalf("assignment was not applied to first location: %#v", firstEmployee)
+	}
+	secondEmployee, err := getEmployee(db, secondLocationID, "12-1083836")
+	if err != nil {
+		t.Fatalf("get second employee: %v", err)
+	}
+	if secondEmployee.RoleName != nil || secondEmployee.DepartmentName != nil {
+		t.Fatalf("assignment crossed location boundary: %#v", secondEmployee)
 	}
 }
 
-func TestImportBioInheritsEmployeeAssignmentsByEmployeeNumber(t *testing.T) {
+func TestImportBioDoesNotInheritRoleOrDepartmentAcrossLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
@@ -316,11 +366,11 @@ func TestImportBioInheritsEmployeeAssignmentsByEmployeeNumber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
-	roleID, err := createRole(db, "Trainer")
+	roleID, err := createRole(db, firstLocationID, "Trainer")
 	if err != nil {
 		t.Fatalf("createRole: %v", err)
 	}
-	departmentID, err := createDepartment(db, "Front of House")
+	departmentID, err := createDepartment(db, firstLocationID, "Front of House")
 	if err != nil {
 		t.Fatalf("createDepartment: %v", err)
 	}
@@ -344,8 +394,8 @@ func TestImportBioInheritsEmployeeAssignmentsByEmployeeNumber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getEmployee: %v", err)
 	}
-	if employee.RoleName == nil || *employee.RoleName != "Trainer" || employee.DepartmentName == nil || *employee.DepartmentName != "Front of House" {
-		t.Fatalf("imported employee did not inherit assignment: %#v", employee)
+	if employee.RoleName != nil || employee.DepartmentName != nil {
+		t.Fatalf("imported employee inherited assignment across locations: %#v", employee)
 	}
 }
 
@@ -366,7 +416,7 @@ func TestImportBioPreservesRolesForRemainingEmployees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
-	roleID, err := createRole(db, "Trainer")
+	roleID, err := createRole(db, locationID, "Trainer")
 	if err != nil {
 		t.Fatalf("createRole: %v", err)
 	}

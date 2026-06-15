@@ -42,6 +42,7 @@ go run . admin-env -username admin -password change-me
 ```sh
 cfasuite-hr init
 cfasuite-hr db path
+cfasuite-hr db reset -yes
 cfasuite-hr serve
 cfasuite-hr token create -name "Reporting"
 cfasuite-hr token list
@@ -54,6 +55,8 @@ cfasuite-hr api-context -base-url https://hr.example.com
 ```sh
 sqlite3 "$(cfasuite-hr db path)" ".tables"
 ```
+
+`db reset -yes` deletes the SQLite database file, removes SQLite sidecar files, and recreates an empty migrated database. This permanently deletes application data, so copy the database first if you need a backup.
 
 ## Employee Bio Imports
 
@@ -69,9 +72,11 @@ Rows with `Employee Status` equal to `Terminated` are skipped. Existing employee
 
 ## Roles
 
-Admins create available employee roles globally in the admin UI. Roles are separate from the imported `Job` field: `Job` comes from the employee bio, while `role_id` and `role_name` are cfasuite-hr assignments.
+Admins create available employee roles per location in the admin UI. Roles are separate from the imported `Job` field: `Job` comes from the employee bio, while `role_id` and `role_name` are cfasuite-hr assignments.
 
 New employees imported from an employee bio have no role until the admin assigns one. Open a location to bulk-select employees and apply a role, or clear their role by applying `Unassigned`. If an employee is removed by a later bio sync, that employee's role assignment is removed with the employee row.
+
+Departments are also location-specific. Each location can use its own department names and assignments without affecting other locations.
 
 ## Birthday Report Imports
 

@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1370,6 +1371,58 @@ func TestAdminTemplatesRender(t *testing.T) {
 			}
 			if buf.Len() == 0 {
 				t.Fatal("template rendered empty output")
+			}
+		})
+	}
+}
+
+func TestMissingDateNoticesLinkToCalendarDays(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		data map[string]any
+		want string
+	}{
+		{
+			name: "sales",
+			body: locationSalesHTML,
+			data: map[string]any{
+				"Title":             "Sales",
+				"Location":          Location{ID: 2, Name: "Southroads", Number: "03394"},
+				"StartDate":         "2026-06-08",
+				"EndDate":           "2026-06-09",
+				"MissingDates":      []string{"2026-06-09"},
+				"Complete":          false,
+				"SelectedDateCount": 2,
+			},
+			want: `<a class="missing-date-link" href="/locations/2/calendar/2026-06-09">Tuesday, June 9, 2026</a>`,
+		},
+		{
+			name: "labor",
+			body: laborHTML,
+			data: map[string]any{
+				"Title":            "Labor",
+				"SelectedLocation": Location{ID: 2, Name: "Southroads", Number: "03394"},
+				"StartDate":        "2026-06-08",
+				"EndDate":          "2026-06-09",
+				"MissingDates":     []string{"2026-06-09"},
+				"Complete":         false,
+			},
+			want: `<a class="missing-date-link" href="/locations/2/calendar/2026-06-09">Tuesday, June 9, 2026</a>`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpl, err := template.New("layout").Funcs(templateFuncs()).Parse(layoutHTML + tt.body)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			var buf bytes.Buffer
+			if err := tmpl.ExecuteTemplate(&buf, "layout", tt.data); err != nil {
+				t.Fatalf("ExecuteTemplate: %v", err)
+			}
+			if !strings.Contains(buf.String(), tt.want) {
+				t.Fatalf("rendered missing date link not found; want %q in:\n%s", tt.want, buf.String())
 			}
 		})
 	}

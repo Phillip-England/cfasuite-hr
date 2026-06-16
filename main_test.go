@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -941,6 +942,30 @@ Employee Totals 0:00 0:00 $0.00 $0.00
 	}
 }
 
+func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
+	month := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local)
+	today := time.Date(2026, time.June, 13, 12, 0, 0, 0, time.Local)
+	days := calendarDays(month, today)
+	if len(days) != 42 {
+		t.Fatalf("expected 42 calendar cells, got %d", len(days))
+	}
+	if days[0].Date != "2026-05-31" || days[1].Date != "2026-06-01" {
+		t.Fatalf("unexpected calendar start: %#v %#v", days[0], days[1])
+	}
+	if !days[1].CurrentMonth || days[0].CurrentMonth {
+		t.Fatalf("current month flags were not set correctly: %#v %#v", days[0], days[1])
+	}
+	var foundToday bool
+	for _, day := range days {
+		if day.Date == "2026-06-13" {
+			foundToday = day.Today
+		}
+	}
+	if !foundToday {
+		t.Fatal("expected June 13 to be marked today")
+	}
+}
+
 func TestAdminTemplatesRender(t *testing.T) {
 	templates := []struct {
 		name string
@@ -1029,6 +1054,31 @@ func TestAdminTemplatesRender(t *testing.T) {
 					LocationLatestStartDate: "2024-10-01",
 				}},
 				"Import": url.Values{},
+			},
+		},
+		{
+			name: "location calendar",
+			body: locationCalendarHTML,
+			data: map[string]any{
+				"Title":      "Calendar",
+				"Location":   Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"MonthLabel": "June 2026",
+				"MonthValue": "2026-06",
+				"PrevMonth":  "2026-05",
+				"NextMonth":  "2026-07",
+				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local)),
+			},
+		},
+		{
+			name: "location calendar day",
+			body: locationCalendarDayHTML,
+			data: map[string]any{
+				"Title":       "Calendar Day",
+				"Location":    Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Date":        "2026-06-13",
+				"DateLabel":   "Saturday, June 13, 2026",
+				"MonthValue":  "2026-06",
+				"BackToMonth": "/locations/1/calendar?month=2026-06",
 			},
 		},
 		{

@@ -427,6 +427,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /locations/{id}", a.requireAdmin(a.locationShow))
 	mux.HandleFunc("GET /locations/{id}/details", a.requireAdmin(a.locationDetails))
 	mux.HandleFunc("GET /locations/{id}/pay", a.requireAdmin(a.locationPay))
+	mux.HandleFunc("GET /locations/{id}/calendar", a.requireAdmin(a.locationCalendar))
+	mux.HandleFunc("GET /locations/{id}/calendar/{date}", a.requireAdmin(a.locationCalendarDay))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
 	mux.HandleFunc("GET /locations/{id}/edit", a.requireAdmin(a.locationEdit))
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
@@ -603,6 +605,57 @@ func (a *App) locationPay(w http.ResponseWriter, r *http.Request) {
 		"Location":  loc,
 		"Employees": employees,
 		"Import":    r.URL.Query(),
+	})
+}
+
+func (a *App) locationCalendar(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	month, err := calendarMonthFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.render(w, loc.Name+" Calendar", locationCalendarHTML, map[string]any{
+		"Location":   loc,
+		"MonthLabel": month.Format("January 2006"),
+		"MonthValue": month.Format("2006-01"),
+		"PrevMonth":  month.AddDate(0, -1, 0).Format("2006-01"),
+		"NextMonth":  month.AddDate(0, 1, 0).Format("2006-01"),
+		"Days":       calendarDays(month, time.Now()),
+	})
+}
+
+func (a *App) locationCalendarDay(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	date, err := time.ParseInLocation("2006-01-02", r.PathValue("date"), time.Local)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a.render(w, loc.Name+" "+date.Format("January 2, 2006"), locationCalendarDayHTML, map[string]any{
+		"Location":    loc,
+		"Date":        date.Format("2006-01-02"),
+		"DateLabel":   date.Format("Monday, January 2, 2006"),
+		"MonthValue":  time.Date(date.Year(), date.Month(), 1, 0, 0, 0, 0, date.Location()).Format("2006-01"),
+		"BackToMonth": fmt.Sprintf("/locations/%d/calendar?month=%s", loc.ID, date.Format("2006-01")),
 	})
 }
 
@@ -3268,6 +3321,37 @@ func parseInt64Values(values []string) ([]int64, error) {
 	return ids, nil
 }
 
+func calendarMonthFromRequest(r *http.Request) (time.Time, error) {
+	value := strings.TrimSpace(r.URL.Query().Get("month"))
+	now := time.Now()
+	if value == "" {
+		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local), nil
+	}
+	month, err := time.ParseInLocation("2006-01", value, time.Local)
+	if err != nil {
+		return time.Time{}, errors.New("month must use YYYY-MM format")
+	}
+	return time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.Local), nil
+}
+
+func calendarDays(month, today time.Time) []CalendarDay {
+	first := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, month.Location())
+	start := first.AddDate(0, 0, -int(first.Weekday()))
+	todayDate := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+	days := make([]CalendarDay, 0, 42)
+	for i := 0; i < 42; i++ {
+		current := start.AddDate(0, 0, i)
+		currentDate := time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, current.Location())
+		days = append(days, CalendarDay{
+			Date:         current.Format("2006-01-02"),
+			Day:          current.Day(),
+			CurrentMonth: current.Month() == first.Month(),
+			Today:        currentDate.Equal(todayDate),
+		})
+	}
+	return days
+}
+
 func randomToken(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -3436,6 +3520,7 @@ const locationShowHTML = `{{define "body"}}
   <a class="active" href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3586,6 +3671,7 @@ const locationDetailsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a class="active" href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3652,6 +3738,7 @@ const locationPayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a class="active" href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3744,6 +3831,64 @@ const locationPayHTML = `{{define "body"}}
 </script>
 {{end}}`
 
+const locationCalendarHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Calendar</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a class="active" href="/locations/{{.Location.ID}}/calendar">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+<section class="panel">
+  <div class="calendar-head">
+    <a class="button secondary" href="/locations/{{.Location.ID}}/calendar?month={{.PrevMonth}}">Previous</a>
+    <h2>{{.MonthLabel}}</h2>
+    <a class="button secondary" href="/locations/{{.Location.ID}}/calendar?month={{.NextMonth}}">Next</a>
+  </div>
+  <div class="calendar-grid calendar-weekdays" aria-hidden="true">
+    <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+  </div>
+  <div class="calendar-grid">
+    {{range .Days}}<a class="calendar-day {{if not .CurrentMonth}}outside{{end}} {{if .Today}}today{{end}}" href="/locations/{{$.Location.ID}}/calendar/{{.Date}}"><span>{{.Day}}</span></a>{{end}}
+  </div>
+</section>
+{{end}}`
+
+const locationCalendarDayHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Calendar</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+  <a class="button secondary" href="{{.BackToMonth}}">Back to month</a>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a class="active" href="/locations/{{.Location.ID}}/calendar?month={{.MonthValue}}">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+<section class="panel">
+  <h2>{{.DateLabel}}</h2>
+  <p class="muted">{{.Date}}</p>
+</section>
+{{end}}`
+
 const locationDocumentsHTML = `{{define "body"}}
 <div class="row">
   <div>
@@ -3755,6 +3900,7 @@ const locationDocumentsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3797,6 +3943,7 @@ const locationEditHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3830,6 +3977,7 @@ const laborHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
   <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -3963,6 +4111,7 @@ const rolesHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
   <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -4006,6 +4155,7 @@ const departmentsHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
   <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -4088,6 +4238,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
-@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin-bottom:18px}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{min-height:96px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px}.calendar-day.outside{color:#666;background:#080808}.calendar-day.today span{background:var(--accent);color:white;font-weight:800}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:block;margin-top:12px;padding:12px;overflow:auto}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:58px;padding:6px}.calendar-day span{width:24px;height:24px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

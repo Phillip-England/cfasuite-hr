@@ -72,6 +72,13 @@ type AssignmentStatus struct {
 	DepartmentUnassigned int
 }
 
+type CalendarDay struct {
+	Date         string
+	Day          int
+	CurrentMonth bool
+	Today        bool
+}
+
 type Role struct {
 	ID         int64     `json:"id"`
 	LocationID int64     `json:"location_id"`

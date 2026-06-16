@@ -789,6 +789,51 @@ All Employees Grand Total 19:30 19:30 $286.50 $286.50
 	}
 }
 
+func TestSaveDailyLaborPersistsSelectedDate(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	report, err := parseTimePunchText(`Employee Time Detail
+Store
+From Monday, May 11, 2026 through Tuesday, May 12, 2026
+Baker, Ramond Manley (Ray)
+Mon, 05/11/2026 8:00a 1:00p 5:00 Regular $15.00 5:00 $75.00 $75.00
+Mon, 05/11/2026 1:00p 3:00p 2:00 Overtime $22.50 2:00 $45.00 $45.00
+Tue, 05/12/2026 8:00a 2:00p 6:00 Regular $15.00 6:00 $90.00 $90.00
+`)
+	if err != nil {
+		t.Fatalf("parseTimePunchText: %v", err)
+	}
+	report.Employees[0].Role = "Trainer"
+	report.Employees[0].Department = "Front of House"
+	report.Employees[0].Job = "Team Member"
+	if err := saveDailyLabor(db, locationID, "2026-05-11", report); err != nil {
+		t.Fatalf("saveDailyLabor: %v", err)
+	}
+	labor, err := listDailyLabor(db, locationID, "2026-05-01", "2026-05-31")
+	if err != nil {
+		t.Fatalf("listDailyLabor: %v", err)
+	}
+	if len(labor) != 1 {
+		t.Fatalf("expected one stored labor day, got %#v", labor)
+	}
+	if labor[0].BusinessDate != "2026-05-11" || labor[0].TotalMinutes != 420 || labor[0].OvertimeMinutes != 120 || labor[0].TotalWagesCents != 12000 {
+		t.Fatalf("unexpected stored labor day: %#v", labor[0])
+	}
+	if labor[0].Roles["Trainer"].WagesCents != 12000 || labor[0].Jobs["Team Member"].Minutes != 420 {
+		t.Fatalf("expected stored breakdowns, got %#v", labor[0])
+	}
+}
+
 func TestParseTimePunchPDFSample(t *testing.T) {
 	data, err := os.ReadFile("tp.pdf")
 	if err != nil {
@@ -1029,7 +1074,7 @@ Employee Totals 0:00 0:00 $0.00 $0.00
 func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	month := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local)
 	today := time.Date(2026, time.June, 13, 12, 0, 0, 0, time.Local)
-	days := calendarDays(month, today, map[string]bool{"2026-06-13": true})
+	days := calendarDays(month, today, map[string]bool{"2026-06-12": true, "2026-06-13": true}, map[string]bool{"2026-06-12": true})
 	if len(days) != 42 {
 		t.Fatalf("expected 42 calendar cells, got %d", len(days))
 	}
@@ -1051,8 +1096,14 @@ func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	if !days[13].HasSales {
 		t.Fatal("expected June 13 to show imported sales")
 	}
+	if !days[12].Complete {
+		t.Fatal("expected past day with sales and labor to be complete")
+	}
 	if !days[7].Sunday || days[7].SalesRequired || !days[7].Complete {
 		t.Fatalf("expected current-month Sunday to be complete without required sales: %#v", days[7])
+	}
+	if days[13].Accessible {
+		t.Fatal("expected today to not be accessible")
 	}
 	if days[0].SalesRequired {
 		t.Fatal("expected outside-month day to not require sales")
@@ -1159,7 +1210,7 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"MonthValue": "2026-06",
 				"PrevMonth":  "2026-05",
 				"NextMonth":  "2026-07",
-				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local), map[string]bool{"2026-06-13": true}),
+				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local), map[string]bool{"2026-06-13": true}, map[string]bool{}),
 			},
 		},
 		{

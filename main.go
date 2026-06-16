@@ -349,6 +349,30 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY(location_id, business_date) REFERENCES daily_sales(location_id, business_date) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_daily_sales_location_date ON daily_sales(location_id, business_date)`,
+		`CREATE TABLE IF NOT EXISTS daily_labor (
+			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+			business_date TEXT NOT NULL,
+			total_minutes INTEGER NOT NULL,
+			overtime_minutes INTEGER NOT NULL DEFAULT 0,
+			total_wages_cents INTEGER NOT NULL,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY(location_id, business_date)
+		)`,
+		`CREATE TABLE IF NOT EXISTS daily_labor_breakdowns (
+			location_id INTEGER NOT NULL,
+			business_date TEXT NOT NULL,
+			group_type TEXT NOT NULL,
+			label TEXT NOT NULL,
+			minutes INTEGER NOT NULL,
+			overtime_minutes INTEGER NOT NULL DEFAULT 0,
+			wages_cents INTEGER NOT NULL,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY(location_id, business_date, group_type, label),
+			FOREIGN KEY(location_id, business_date) REFERENCES daily_labor(location_id, business_date) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_daily_labor_location_date ON daily_labor(location_id, business_date)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -451,6 +475,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /locations/{id}/calendar", a.requireAdmin(a.locationCalendar))
 	mux.HandleFunc("GET /locations/{id}/calendar/{date}", a.requireAdmin(a.locationCalendarDay))
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/sales", a.requireAdmin(a.locationSalesUpload))
+	mux.HandleFunc("POST /locations/{id}/calendar/{date}/labor", a.requireAdmin(a.locationLaborUpload))
 	mux.HandleFunc("GET /locations/{id}/sales", a.requireAdmin(a.locationSales))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
 	mux.HandleFunc("GET /locations/{id}/edit", a.requireAdmin(a.locationEdit))
@@ -459,6 +484,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
 	mux.HandleFunc("POST /locations/{id}/pins/upload", a.requireAdmin(a.pinUpload))
+	mux.HandleFunc("POST /locations/{id}/documents/time-punch-wages", a.requireAdmin(a.documentTimePunchWageUpload))
 	mux.HandleFunc("POST /locations/{id}/assignments", a.requireAdmin(a.locationAssignmentsUpdate))
 	mux.HandleFunc("POST /locations/{id}/roles", a.requireAdmin(a.locationRolesUpdate))
 	mux.HandleFunc("GET /locations/{id}/roles", a.requireAdmin(a.rolesPage))
@@ -652,13 +678,18 @@ func (a *App) locationCalendar(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	laborDates, err := laborDatesForCalendar(a.db, id, month)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	a.render(w, loc.Name+" Calendar", locationCalendarHTML, map[string]any{
 		"Location":   loc,
 		"MonthLabel": month.Format("January 2006"),
 		"MonthValue": month.Format("2006-01"),
 		"PrevMonth":  month.AddDate(0, -1, 0).Format("2006-01"),
 		"NextMonth":  month.AddDate(0, 1, 0).Format("2006-01"),
-		"Days":       calendarDays(month, time.Now(), salesDates),
+		"Days":       calendarDays(month, time.Now(), salesDates, laborDates),
 	})
 }
 
@@ -678,10 +709,24 @@ func (a *App) locationCalendarDay(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !date.Before(startOfDay(time.Now())) {
+		http.Error(w, "calendar days can only be opened after the day is complete", http.StatusNotFound)
+		return
+	}
 	sales, err := getDailySales(a.db, loc.ID, date.Format("2006-01-02"))
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	labor, err := getDailyLabor(a.db, loc.ID, date.Format("2006-01-02"))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	nextDay := date.AddDate(0, 0, 1)
+	nextDayURL := ""
+	if nextDay.Before(startOfDay(time.Now())) {
+		nextDayURL = fmt.Sprintf("/locations/%d/calendar/%s", loc.ID, nextDay.Format("2006-01-02"))
 	}
 	a.render(w, loc.Name+" "+date.Format("January 2, 2006"), locationCalendarDayHTML, map[string]any{
 		"Location":    loc,
@@ -690,8 +735,9 @@ func (a *App) locationCalendarDay(w http.ResponseWriter, r *http.Request) {
 		"MonthValue":  time.Date(date.Year(), date.Month(), 1, 0, 0, 0, 0, date.Location()).Format("2006-01"),
 		"BackToMonth": fmt.Sprintf("/locations/%d/calendar?month=%s", loc.ID, date.Format("2006-01")),
 		"PrevDayURL":  fmt.Sprintf("/locations/%d/calendar/%s", loc.ID, date.AddDate(0, 0, -1).Format("2006-01-02")),
-		"NextDayURL":  fmt.Sprintf("/locations/%d/calendar/%s", loc.ID, date.AddDate(0, 0, 1).Format("2006-01-02")),
+		"NextDayURL":  nextDayURL,
 		"Sales":       sales,
+		"Labor":       labor,
 		"Import":      r.URL.Query(),
 	})
 }
@@ -709,6 +755,10 @@ func (a *App) locationSalesUpload(w http.ResponseWriter, r *http.Request) {
 	date, err := time.ParseInLocation("2006-01-02", r.PathValue("date"), time.Local)
 	if err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if !date.Before(startOfDay(time.Now())) {
+		http.Error(w, "sales can only be uploaded for completed past days", http.StatusBadRequest)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
@@ -737,6 +787,49 @@ func (a *App) locationSalesUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d/calendar/%s?sales_imported=1", id, selectedDate), http.StatusSeeOther)
+}
+
+func (a *App) locationLaborUpload(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	date, err := time.ParseInLocation("2006-01-02", r.PathValue("date"), time.Local)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !date.Before(startOfDay(time.Now())) {
+		http.Error(w, "labor can only be uploaded for completed past days", http.StatusBadRequest)
+		return
+	}
+	report, err := timePunchReportFromRequest(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employees, err := listEmployees(a.db, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	applyEmployeeAssignments(&report, employees)
+	finalizeLaborReport(&report, employees)
+	selectedDate := date.Format("2006-01-02")
+	if !laborReportIncludesDate(report, selectedDate) {
+		http.Error(w, fmt.Sprintf("time punch report does not include selected date %s", selectedDate), http.StatusBadRequest)
+		return
+	}
+	if err := saveDailyLabor(a.db, id, selectedDate, report); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/calendar/%s?labor_imported=1", id, selectedDate), http.StatusSeeOther)
 }
 
 func (a *App) locationSales(w http.ResponseWriter, r *http.Request) {
@@ -787,6 +880,33 @@ func (a *App) locationDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.render(w, loc.Name+" Documents", locationDocumentsHTML, map[string]any{"Location": loc, "Import": r.URL.Query()})
+}
+
+func (a *App) documentTimePunchWageUpload(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, locationID); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	report, err := timePunchReportFromRequest(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	employees, err := listEmployees(a.db, locationID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := updateEmployeeWagesFromReport(a.db, report, employees); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/documents?wages_imported=1", locationID), http.StatusSeeOther)
 }
 
 func (a *App) locationEdit(w http.ResponseWriter, r *http.Request) {
@@ -1140,7 +1260,18 @@ func (a *App) laborPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{"SelectedLocation": loc})
+	start, end, err := laborRangeFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	labor, err := listDailyLabor(a.db, locationID, start.Format("2006-01-02"), end.Format("2006-01-02"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	missing := missingLaborDates(start, end, labor)
+	a.render(w, loc.Name+" Labor", laborHTML, laborPageData(loc, start, end, labor, missing, nil))
 }
 
 func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
@@ -1154,18 +1285,7 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	file, header, err := r.FormFile("time_punch")
-	if err != nil {
-		http.Error(w, "time punch report PDF is required", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-	report, err := parseTimePunchPDF(file, header)
+	report, err := timePunchReportFromRequest(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1175,28 +1295,12 @@ func (a *App) laborUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := updateEmployeeWagesFromReport(a.db, report, employees); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	employees, err = listEmployees(a.db, locationID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	applyEmployeeAssignments(&report, employees)
 	finalizeLaborReport(&report, employees)
-	a.render(w, loc.Name+" Labor", laborHTML, map[string]any{
-		"SelectedLocation": loc,
-		"Report":           report,
-		"Summary":          laborSummary(report),
-		"DayRows":          laborDayRows(report),
-		"RoleRows":         laborRoleRows(report),
-		"DepartmentRows":   laborDepartmentRows(report),
-		"EmployeeRows":     laborEmployeeRows(report),
-		"EmployeeJobs":     laborEmployeeJobOptions(report),
-		"JobRows":          laborJobRows(report),
-	})
+	start, end, _ := laborRangeFromRequest(r)
+	labor, _ := listDailyLabor(a.db, locationID, start.Format("2006-01-02"), end.Format("2006-01-02"))
+	missing := missingLaborDates(start, end, labor)
+	a.render(w, loc.Name+" Labor", laborHTML, laborPageData(loc, start, end, labor, missing, &report))
 }
 
 func (a *App) rolesPage(w http.ResponseWriter, r *http.Request) {
@@ -1540,6 +1644,7 @@ func templateFuncs() template.FuncMap {
 		"formatMoney": func(cents int64) string {
 			return formatDollars(cents)
 		},
+		"formatHours":        formatHours,
 		"formatISODate":      formatISODate,
 		"salesRowsForLabels": salesRowsForLabels,
 		"salesDayparts": func() []string {
@@ -2670,6 +2775,377 @@ func salesRowsForLabels(values map[string]int64, labels []string) []SalesBreakdo
 	return rows
 }
 
+func saveDailyLabor(db *sql.DB, locationID int64, date string, report TimePunchReport) error {
+	daily := dailyLaborFromReport(locationID, date, report)
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO daily_labor (location_id, business_date, total_minutes, overtime_minutes, total_wages_cents, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(location_id, business_date) DO UPDATE SET total_minutes = excluded.total_minutes, overtime_minutes = excluded.overtime_minutes, total_wages_cents = excluded.total_wages_cents, updated_at = CURRENT_TIMESTAMP`,
+		locationID, date, daily.TotalMinutes, daily.OvertimeMinutes, daily.TotalWagesCents)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM daily_labor_breakdowns WHERE location_id = ? AND business_date = ?`, locationID, date); err != nil {
+		return err
+	}
+	for groupType, groups := range map[string]map[string]LaborTotals{
+		"role":       daily.Roles,
+		"department": daily.Departments,
+		"job":        daily.Jobs,
+		"employee":   daily.Employees,
+	} {
+		for label, total := range groups {
+			if _, err := tx.Exec(`INSERT INTO daily_labor_breakdowns (location_id, business_date, group_type, label, minutes, overtime_minutes, wages_cents)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`, locationID, date, groupType, label, total.Minutes, total.OvertimeMinutes, total.WagesCents); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func dailyLaborFromReport(locationID int64, date string, report TimePunchReport) DailyLabor {
+	daily := DailyLabor{
+		LocationID:   locationID,
+		BusinessDate: date,
+		Roles:        map[string]LaborTotals{},
+		Departments:  map[string]LaborTotals{},
+		Jobs:         map[string]LaborTotals{},
+		Employees:    map[string]LaborTotals{},
+	}
+	for _, employee := range report.Employees {
+		for _, day := range employee.Days {
+			if day.Date != date {
+				continue
+			}
+			total := LaborTotals{Minutes: day.Minutes, OvertimeMinutes: day.OvertimeMinutes, WagesCents: day.WagesCents}
+			daily.TotalMinutes += total.Minutes
+			daily.OvertimeMinutes += total.OvertimeMinutes
+			daily.TotalWagesCents += total.WagesCents
+			addLaborTotals(daily.Roles, laborValueOrUnassigned(employee.Role), total)
+			addLaborTotals(daily.Departments, laborValueOrUnassigned(employee.Department), total)
+			addLaborTotals(daily.Jobs, laborValueOrUnassigned(employee.Job), total)
+			addLaborTotals(daily.Employees, laborValueOrUnassigned(employee.Name), total)
+		}
+	}
+	return daily
+}
+
+func getDailyLabor(db *sql.DB, locationID int64, date string) (DailyLabor, error) {
+	rows, err := listDailyLabor(db, locationID, date, date)
+	if err != nil {
+		return DailyLabor{}, err
+	}
+	if len(rows) == 0 {
+		return DailyLabor{}, sql.ErrNoRows
+	}
+	return rows[0], nil
+}
+
+func listDailyLabor(db *sql.DB, locationID int64, startDate, endDate string) ([]DailyLabor, error) {
+	rows, err := db.Query(`SELECT location_id, business_date, total_minutes, overtime_minutes, total_wages_cents, created_at, updated_at
+		FROM daily_labor
+		WHERE location_id = ? AND business_date BETWEEN ? AND ?
+		ORDER BY business_date`, locationID, startDate, endDate)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var labor []DailyLabor
+	for rows.Next() {
+		var day DailyLabor
+		var created, updated string
+		if err := rows.Scan(&day.LocationID, &day.BusinessDate, &day.TotalMinutes, &day.OvertimeMinutes, &day.TotalWagesCents, &created, &updated); err != nil {
+			return nil, err
+		}
+		day.CreatedAt = parseTime(created)
+		day.UpdatedAt = parseTime(updated)
+		day.Roles = map[string]LaborTotals{}
+		day.Departments = map[string]LaborTotals{}
+		day.Jobs = map[string]LaborTotals{}
+		day.Employees = map[string]LaborTotals{}
+		labor = append(labor, day)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range labor {
+		if err := loadLaborBreakdowns(db, &labor[i]); err != nil {
+			return nil, err
+		}
+	}
+	return labor, nil
+}
+
+func loadLaborBreakdowns(db *sql.DB, labor *DailyLabor) error {
+	rows, err := db.Query(`SELECT group_type, label, minutes, overtime_minutes, wages_cents
+		FROM daily_labor_breakdowns
+		WHERE location_id = ? AND business_date = ?
+		ORDER BY group_type, label`, labor.LocationID, labor.BusinessDate)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var groupType, label string
+		var total LaborTotals
+		if err := rows.Scan(&groupType, &label, &total.Minutes, &total.OvertimeMinutes, &total.WagesCents); err != nil {
+			return err
+		}
+		switch groupType {
+		case "role":
+			labor.Roles[label] = total
+		case "department":
+			labor.Departments[label] = total
+		case "job":
+			labor.Jobs[label] = total
+		case "employee":
+			labor.Employees[label] = total
+		}
+	}
+	return rows.Err()
+}
+
+func laborDatesForCalendar(db *sql.DB, locationID int64, month time.Time) (map[string]bool, error) {
+	first := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, month.Location())
+	start := first.AddDate(0, 0, -int(first.Weekday())).Format("2006-01-02")
+	end := first.AddDate(0, 0, -int(first.Weekday())+41).Format("2006-01-02")
+	rows, err := db.Query(`SELECT business_date FROM daily_labor WHERE location_id = ? AND business_date BETWEEN ? AND ?`, locationID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	dates := map[string]bool{}
+	for rows.Next() {
+		var date string
+		if err := rows.Scan(&date); err != nil {
+			return nil, err
+		}
+		dates[date] = true
+	}
+	return dates, rows.Err()
+}
+
+func laborRangeFromRequest(r *http.Request) (time.Time, time.Time, error) {
+	now := startOfDay(time.Now())
+	defaultEnd := now.AddDate(0, 0, -1)
+	startValue := strings.TrimSpace(r.URL.Query().Get("start"))
+	endValue := strings.TrimSpace(r.URL.Query().Get("end"))
+	if startValue == "" {
+		startValue = time.Date(defaultEnd.Year(), defaultEnd.Month(), 1, 0, 0, 0, 0, time.Local).Format("2006-01-02")
+	}
+	if endValue == "" {
+		endValue = defaultEnd.Format("2006-01-02")
+	}
+	start, err := time.ParseInLocation("2006-01-02", startValue, time.Local)
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.New("start must use YYYY-MM-DD format")
+	}
+	end, err := time.ParseInLocation("2006-01-02", endValue, time.Local)
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.New("end must use YYYY-MM-DD format")
+	}
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, errors.New("end must be on or after start")
+	}
+	if !end.Before(now) {
+		return time.Time{}, time.Time{}, errors.New("labor reports can only include completed past days")
+	}
+	return start, end, nil
+}
+
+func missingLaborDates(start, end time.Time, labor []DailyLabor) []string {
+	present := map[string]bool{}
+	for _, day := range labor {
+		present[day.BusinessDate] = true
+	}
+	var missing []string
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		if d.Weekday() == time.Sunday {
+			continue
+		}
+		date := d.Format("2006-01-02")
+		if !present[date] {
+			missing = append(missing, date)
+		}
+	}
+	return missing
+}
+
+func laborPageData(loc Location, start, end time.Time, labor []DailyLabor, missing []string, report *TimePunchReport) map[string]any {
+	data := map[string]any{
+		"SelectedLocation": loc,
+		"StartDate":        start.Format("2006-01-02"),
+		"EndDate":          end.Format("2006-01-02"),
+		"MissingDates":     missing,
+		"Complete":         len(missing) == 0,
+		"DailyLaborRows":   laborDailyRows(labor),
+		"LaborDayRows":     laborDayOfWeekRows(labor),
+		"LaborRoleRows":    aggregateStoredLaborRows(labor, "role"),
+		"LaborDeptRows":    aggregateStoredLaborRows(labor, "department"),
+		"LaborJobRows":     aggregateStoredLaborRows(labor, "job"),
+		"LaborSummary":     storedLaborSummary(labor),
+	}
+	if report != nil {
+		data["Report"] = *report
+		data["Summary"] = laborSummary(*report)
+		data["DayRows"] = laborDayRows(*report)
+		data["RoleRows"] = laborRoleRows(*report)
+		data["DepartmentRows"] = laborDepartmentRows(*report)
+		data["EmployeeRows"] = laborEmployeeRows(*report)
+		data["EmployeeJobs"] = laborEmployeeJobOptions(*report)
+		data["JobRows"] = laborJobRows(*report)
+	}
+	return data
+}
+
+func laborDailyRows(labor []DailyLabor) []LaborDailyRow {
+	rows := make([]LaborDailyRow, 0, len(labor))
+	for _, day := range labor {
+		date, _ := time.ParseInLocation("2006-01-02", day.BusinessDate, time.Local)
+		rows = append(rows, LaborDailyRow{
+			Date:          day.BusinessDate,
+			DateLabel:     formatISODate(day.BusinessDate),
+			Weekday:       date.Format("Monday"),
+			Hours:         formatHours(day.TotalMinutes),
+			OvertimeHours: formatHours(day.OvertimeMinutes),
+			Dollars:       formatDollars(day.TotalWagesCents),
+			MinutesValue:  day.TotalMinutes,
+			CentsValue:    day.TotalWagesCents,
+		})
+	}
+	return rows
+}
+
+func laborDayOfWeekRows(labor []DailyLabor) []LaborDayRow {
+	totals := map[string]LaborTotals{}
+	dates := map[string]map[string]bool{}
+	for _, day := range labor {
+		date, err := time.ParseInLocation("2006-01-02", day.BusinessDate, time.Local)
+		if err != nil {
+			continue
+		}
+		key := date.Format("Monday")
+		total := totals[key]
+		total.Minutes += day.TotalMinutes
+		total.OvertimeMinutes += day.OvertimeMinutes
+		total.WagesCents += day.TotalWagesCents
+		totals[key] = total
+		if dates[key] == nil {
+			dates[key] = map[string]bool{}
+		}
+		dates[key][day.BusinessDate] = true
+	}
+	grand := sumStoredLabor(labor)
+	var rows []LaborDayRow
+	for _, day := range []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"} {
+		total := totals[day]
+		rows = append(rows, LaborDayRow{
+			Day:           day,
+			Date:          formatDateList(dates[day]),
+			Hours:         formatHours(total.Minutes),
+			OvertimeHours: formatHours(total.OvertimeMinutes),
+			Dollars:       formatDollars(total.WagesCents),
+			Percent:       formatPercent(total.WagesCents, grand.WagesCents),
+		})
+	}
+	return rows
+}
+
+func aggregateStoredLaborRows(labor []DailyLabor, groupType string) []LaborEmployeeRow {
+	totals := map[string]LaborTotals{}
+	for _, day := range labor {
+		var groups map[string]LaborTotals
+		switch groupType {
+		case "role":
+			groups = day.Roles
+		case "department":
+			groups = day.Departments
+		default:
+			groups = day.Jobs
+		}
+		for label, total := range groups {
+			addLaborTotals(totals, label, total)
+		}
+	}
+	grand := sumStoredLabor(labor)
+	labels := make([]string, 0, len(totals))
+	for label := range totals {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	rows := make([]LaborEmployeeRow, 0, len(labels))
+	for _, label := range labels {
+		total := totals[label]
+		row := LaborEmployeeRow{
+			Hours:        formatHours(total.Minutes),
+			Dollars:      formatDollars(total.WagesCents),
+			Percent:      formatPercent(total.WagesCents, grand.WagesCents),
+			MinutesValue: total.Minutes,
+			CentsValue:   total.WagesCents,
+		}
+		switch groupType {
+		case "role":
+			row.Role = label
+		case "department":
+			row.Department = label
+		default:
+			row.Job = label
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func storedLaborSummary(labor []DailyLabor) []LaborSummary {
+	total := sumStoredLabor(labor)
+	return []LaborSummary{
+		{Label: "Hours", Hours: formatHours(total.Minutes), Dollars: "Overtime " + formatHours(total.OvertimeMinutes)},
+		{Label: "Labor dollars", Hours: formatDollars(total.WagesCents), Dollars: strconv.Itoa(len(labor)) + " imported days"},
+	}
+}
+
+func sumStoredLabor(labor []DailyLabor) LaborTotals {
+	var total LaborTotals
+	for _, day := range labor {
+		total.Minutes += day.TotalMinutes
+		total.OvertimeMinutes += day.OvertimeMinutes
+		total.WagesCents += day.TotalWagesCents
+	}
+	return total
+}
+
+func addLaborTotals(values map[string]LaborTotals, label string, add LaborTotals) {
+	current := values[label]
+	current.Minutes += add.Minutes
+	current.OvertimeMinutes += add.OvertimeMinutes
+	current.WagesCents += add.WagesCents
+	values[label] = current
+}
+
+func laborValueOrUnassigned(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "Unassigned"
+	}
+	return value
+}
+
+func laborReportIncludesDate(report TimePunchReport, date string) bool {
+	for _, employee := range report.Employees {
+		for _, day := range employee.Days {
+			if day.Date == date {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func parseBio(data []byte) ([]BioEmployee, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {
@@ -2947,6 +3423,19 @@ func parseTimePunchPDF(file multipart.File, header *multipart.FileHeader) (TimeP
 	return parseTimePunchText(text.String())
 }
 
+func timePunchReportFromRequest(w http.ResponseWriter, r *http.Request) (TimePunchReport, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		return TimePunchReport{}, err
+	}
+	file, header, err := r.FormFile("time_punch")
+	if err != nil {
+		return TimePunchReport{}, errors.New("time punch report PDF is required")
+	}
+	defer file.Close()
+	return parseTimePunchPDF(file, header)
+}
+
 func parseTimePunchText(text string) (TimePunchReport, error) {
 	report := TimePunchReport{Title: "Employee Time Detail"}
 	var current *LaborEmployee
@@ -2996,26 +3485,40 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 		}
 		payType := strings.ToLower(matches[4])
 		minutes := 0
-		if payType == "regular" {
+		overtimeMinutes := 0
+		switch payType {
+		case "regular":
 			minutes = parseDurationMinutes(matches[3])
+		case "overtime":
+			overtimeMinutes = parseDurationMinutes(matches[3])
+			minutes = overtimeMinutes
 		}
 		day := LaborDay{
-			Weekday:    titleWeekday(matches[1]),
-			Date:       normalizeUSDate(matches[2]),
-			Minutes:    minutes,
-			WagesCents: punchWagesCents(matches[5]),
+			Weekday:         titleWeekday(matches[1]),
+			Date:            normalizeUSDate(matches[2]),
+			Minutes:         minutes,
+			OvertimeMinutes: overtimeMinutes,
+			WagesCents:      punchWagesCents(matches[5]),
 		}
 		addLaborDay(current, day)
 	}
 	for i := range report.Employees {
+		dayTotals := sumEmployeeDays(report.Employees[i])
 		if report.Employees[i].Totals.Minutes == 0 && report.Employees[i].Totals.WagesCents == 0 {
-			report.Employees[i].Totals = sumEmployeeDays(report.Employees[i])
+			report.Employees[i].Totals = dayTotals
+		} else {
+			report.Employees[i].Totals.OvertimeMinutes = dayTotals.OvertimeMinutes
 		}
 	}
 	if report.GrandTotals.Minutes == 0 && report.GrandTotals.WagesCents == 0 {
 		for _, employee := range report.Employees {
 			report.GrandTotals.Minutes += employee.Totals.Minutes
+			report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
 			report.GrandTotals.WagesCents += employee.Totals.WagesCents
+		}
+	} else {
+		for _, employee := range report.Employees {
+			report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
 		}
 	}
 	return report, nil
@@ -3071,6 +3574,7 @@ func addLaborDay(employee *LaborEmployee, day LaborDay) {
 	for i := range employee.Days {
 		if employee.Days[i].Date == day.Date {
 			employee.Days[i].Minutes += day.Minutes
+			employee.Days[i].OvertimeMinutes += day.OvertimeMinutes
 			employee.Days[i].WagesCents += day.WagesCents
 			return
 		}
@@ -3083,6 +3587,7 @@ func sumEmployeeDays(employee LaborEmployee) LaborTotals {
 	var totals LaborTotals
 	for _, day := range employee.Days {
 		totals.Minutes += day.Minutes
+		totals.OvertimeMinutes += day.OvertimeMinutes
 		totals.WagesCents += day.WagesCents
 	}
 	return totals
@@ -3246,6 +3751,7 @@ func recalculateReportTotals(report *TimePunchReport) {
 	report.GrandTotals = LaborTotals{}
 	for _, employee := range report.Employees {
 		report.GrandTotals.Minutes += employee.Totals.Minutes
+		report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
 		report.GrandTotals.WagesCents += employee.Totals.WagesCents
 	}
 }
@@ -3303,6 +3809,7 @@ func laborDayRows(report TimePunchReport) []LaborDayRow {
 				dates[key][day.Date] = true
 			}
 			total.Minutes += day.Minutes
+			total.OvertimeMinutes += day.OvertimeMinutes
 			total.WagesCents += day.WagesCents
 			totals[key] = total
 		}
@@ -3316,11 +3823,12 @@ func laborDayRows(report TimePunchReport) []LaborDayRow {
 	for _, key := range keys {
 		total := totals[key]
 		rows = append(rows, LaborDayRow{
-			Day:     total.Weekday,
-			Date:    formatDateList(dates[key]),
-			Hours:   formatHours(total.Minutes),
-			Dollars: formatDollars(total.WagesCents),
-			Percent: formatPercent(total.WagesCents, report.GrandTotals.WagesCents),
+			Day:           total.Weekday,
+			Date:          formatDateList(dates[key]),
+			Hours:         formatHours(total.Minutes),
+			OvertimeHours: formatHours(total.OvertimeMinutes),
+			Dollars:       formatDollars(total.WagesCents),
+			Percent:       formatPercent(total.WagesCents, report.GrandTotals.WagesCents),
 		})
 	}
 	return rows
@@ -3825,7 +4333,7 @@ Important data rules:
 - Employees are active employees from the latest employee bio import.
 - job is the imported Chick-fil-A job field. role_id, role_name, department_id, and department_name are internal cfasuite-hr assignments and may be null.
 - wage_rate_cents and wage_pay_type are learned from uploaded time punch reports. wage_pay_type is "hourly", "salary", or empty when unknown.
-- exclude_from_labor is location-specific and means the employee is omitted from that location's Labor Board calculations.
+- exclude_from_labor is location-specific and means the employee is omitted from that location's Labor calculations.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
 - Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
 - clock_in_pin is a string from the location PIN report, or null when no PIN has been imported for that employee.
@@ -4005,10 +4513,10 @@ func calendarMonthFromRequest(r *http.Request) (time.Time, error) {
 	return time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.Local), nil
 }
 
-func calendarDays(month, today time.Time, salesDates map[string]bool) []CalendarDay {
+func calendarDays(month, today time.Time, salesDates, laborDates map[string]bool) []CalendarDay {
 	first := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, month.Location())
 	start := first.AddDate(0, 0, -int(first.Weekday()))
-	todayDate := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+	todayDate := startOfDay(today)
 	days := make([]CalendarDay, 0, 42)
 	for i := 0; i < 42; i++ {
 		current := start.AddDate(0, 0, i)
@@ -4016,8 +4524,10 @@ func calendarDays(month, today time.Time, salesDates map[string]bool) []Calendar
 		date := current.Format("2006-01-02")
 		currentMonth := current.Month() == first.Month()
 		sunday := current.Weekday() == time.Sunday
-		required := currentMonth && !sunday
+		accessible := currentDate.Before(todayDate)
+		required := currentMonth && accessible && !sunday
 		hasSales := salesDates[date]
+		hasLabor := laborDates[date]
 		days = append(days, CalendarDay{
 			Date:          date,
 			Label:         current.Format("Monday, January 2, 2006"),
@@ -4025,12 +4535,19 @@ func calendarDays(month, today time.Time, salesDates map[string]bool) []Calendar
 			CurrentMonth:  currentMonth,
 			Today:         currentDate.Equal(todayDate),
 			HasSales:      hasSales,
+			HasLabor:      hasLabor,
 			SalesRequired: required,
-			Complete:      currentMonth && (hasSales || sunday),
+			LaborRequired: required,
+			Complete:      currentMonth && accessible && (sunday || (hasSales && hasLabor)),
 			Sunday:        sunday,
+			Accessible:    accessible,
 		})
 	}
 	return days
+}
+
+func startOfDay(value time.Time) time.Time {
+	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, value.Location())
 }
 
 func randomToken(n int) string {
@@ -4078,7 +4595,7 @@ func urlText(s string) string {
 }
 
 var (
-	punchLineRe                = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*(\d{2}/\d{2}/\d{4})\s*\d{1,2}:\d{2}\s*[ap]\*?\s*(?:\d{1,2}:\d{2}\s*[ap]\*?|Open Punch)\s*(\d{1,4}:\d{2})\s*(Regular|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
+	punchLineRe                = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*(\d{2}/\d{2}/\d{4})\s*\d{1,2}:\d{2}\s*[ap]\*?\s*(?:\d{1,2}:\d{2}\s*[ap]\*?|Open Punch)\s*(\d{1,4}:\d{2})\s*(Regular|Overtime|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
 	employeeTotalsRe           = regexp.MustCompile(`^Employee Totals\s*(\d{1,4}:\d{2})(.*)$`)
 	grandTotalsRe              = regexp.MustCompile(`^All Employees Grand Total\s*(\d{1,4}:\d{2})(.*)$`)
 	periodRe                   = regexp.MustCompile(`^From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+through\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})$`)
@@ -4244,7 +4761,7 @@ const locationShowHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4396,7 +4913,7 @@ const locationDetailsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4464,7 +4981,7 @@ const locationPayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4569,7 +5086,7 @@ const locationCalendarHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4590,7 +5107,7 @@ const locationCalendarHTML = `{{define "body"}}
     <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
   </div>
   <div class="calendar-grid">
-    {{range .Days}}<a class="calendar-day {{if not .CurrentMonth}}outside{{end}} {{if .Sunday}}sunday{{end}} {{if .Today}}today{{end}} {{if .Complete}}complete{{else if .SalesRequired}}missing-sales{{end}}" href="/locations/{{$.Location.ID}}/calendar/{{.Date}}" aria-label="{{.Label}}"><span>{{.Day}}</span><small>{{if .CurrentMonth}}{{if .HasSales}}Sales uploaded{{else if .Sunday}}Sunday{{else}}Needs sales{{end}}{{end}}</small></a>{{end}}
+    {{range .Days}}{{if .Accessible}}<a class="calendar-day {{if not .CurrentMonth}}outside{{end}} {{if .Sunday}}sunday{{end}} {{if .Today}}today{{end}} {{if .Complete}}complete{{else if .SalesRequired}}missing-sales{{end}}" href="/locations/{{$.Location.ID}}/calendar/{{.Date}}" aria-label="{{.Label}}"><span>{{.Day}}</span><small>{{if .CurrentMonth}}{{if .Sunday}}Sunday{{else if .Complete}}Complete{{else if and .HasSales (not .HasLabor)}}Needs labor{{else if and .HasLabor (not .HasSales)}}Needs sales{{else}}Needs sales and labor{{end}}{{end}}</small></a>{{else}}<span class="calendar-day locked {{if not .CurrentMonth}}outside{{end}} {{if .Today}}today{{end}}" aria-label="{{.Label}}"><span>{{.Day}}</span><small>{{if .CurrentMonth}}{{if .Today}}Today{{else}}Future{{end}}{{end}}</small></span>{{end}}{{end}}
   </div>
 </section>
 {{end}}`
@@ -4604,7 +5121,7 @@ const locationCalendarDayHTML = `{{define "body"}}
   <div class="actions">
     <a class="button secondary" href="{{.PrevDayURL}}">Previous day</a>
     <a class="button" href="{{.BackToMonth}}">Back to calendar</a>
-    <a class="button secondary" href="{{.NextDayURL}}">Next day</a>
+    {{if .NextDayURL}}<a class="button secondary" href="{{.NextDayURL}}">Next day</a>{{end}}
   </div>
 </div>
 <nav class="portal-menu">
@@ -4615,7 +5132,7 @@ const locationCalendarDayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4646,6 +5163,26 @@ const locationCalendarDayHTML = `{{define "body"}}
 </section>
 <section class="panel">
   <div class="section-head compact">
+    <div>
+      <h2>Labor data</h2>
+      <p class="muted">Time punch labor associated with this calendar day</p>
+    </div>
+    <a class="button secondary" href="{{.BackToMonth}}">Back to calendar</a>
+  </div>
+  {{if .Import.Get "labor_imported"}}<p class="notice">Time punch labor imported.</p>{{end}}
+  {{if .Labor.BusinessDate}}
+    <section class="overview-grid">
+      <article class="metric"><span>Hours</span><strong>{{formatHours .Labor.TotalMinutes}}</strong></article>
+      <article class="metric"><span>Overtime</span><strong>{{formatHours .Labor.OvertimeMinutes}}</strong></article>
+      <article class="metric"><span>Labor dollars</span><strong>{{formatMoney .Labor.TotalWagesCents}}</strong></article>
+      <article class="metric"><span>Date</span><strong>{{formatISODate .Labor.BusinessDate}}</strong></article>
+    </section>
+  {{else}}
+    <p class="notice bad">Labor data has not been uploaded for this date.</p>
+  {{end}}
+</section>
+<section class="panel">
+  <div class="section-head compact">
     <h2>Upload sales data</h2>
     <a class="button secondary" href="{{.BackToMonth}}">Back to calendar</a>
   </div>
@@ -4654,6 +5191,18 @@ const locationCalendarDayHTML = `{{define "body"}}
       <input type="file" name="daypart_activity" accept=".pdf" required>
     </label>
     <button>Upload sales</button>
+  </form>
+</section>
+<section class="panel">
+  <div class="section-head compact">
+    <h2>Upload labor data</h2>
+    <a class="button secondary" href="{{.BackToMonth}}">Back to calendar</a>
+  </div>
+  <form method="post" action="/locations/{{.Location.ID}}/calendar/{{.Date}}/labor" enctype="multipart/form-data" class="labor-upload">
+    <label>Time punch PDF
+      <input type="file" name="time_punch" accept=".pdf" required>
+    </label>
+    <button>Upload labor</button>
   </form>
 </section>
 {{end}}`
@@ -4673,7 +5222,7 @@ const locationSalesHTML = `{{define "body"}}
   <a class="active" href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4730,13 +5279,14 @@ const locationDocumentsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 {{if .Import.Get "added"}}<p class="notice">Employee bio imported for {{.Location.Name}}. Added {{.Import.Get "added"}}, updated {{.Import.Get "updated"}}, removed {{.Import.Get "removed"}}, skipped {{.Import.Get "skipped"}}.</p>{{end}}
 {{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported for {{.Location.Name}}. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees at this location.</p>{{end}}
 {{if .Import.Get "pin_updated"}}<p class="notice">PIN report imported for {{.Location.Name}}. Updated {{.Import.Get "pin_updated"}} employee records. Skipped {{.Import.Get "pin_skipped"}} rows that did not match current employees at this location.</p>{{end}}
+{{if .Import.Get "wages_imported"}}<p class="notice">Time punch wages imported for {{.Location.Name}}.</p>{{end}}
 <section class="split">
   <form method="post" action="/locations/{{.Location.ID}}/upload" enctype="multipart/form-data" class="panel">
     <h2>Upload employee bio</h2>
@@ -4756,6 +5306,12 @@ const locationDocumentsHTML = `{{define "body"}}
     <input type="file" name="pins" accept=".pdf" required>
     <button>Upload PINs</button>
   </form>
+  <form method="post" action="/locations/{{.Location.ID}}/documents/time-punch-wages" enctype="multipart/form-data" class="panel">
+    <h2>Upload time punch wages</h2>
+    <p class="muted">This reads wage rates from the time punch report and updates employee pay details.</p>
+    <input type="file" name="time_punch" accept=".pdf" required>
+    <button>Import wages</button>
+  </form>
 </section>
 {{end}}`
 
@@ -4774,7 +5330,7 @@ const locationEditHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
-  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -4809,12 +5365,55 @@ const laborHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/sales">Sales</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
-  <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor</a>
   <a href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
   <a href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
 </nav>
+<form method="get" action="/locations/{{.SelectedLocation.ID}}/labor" class="panel inline">
+  <label>Start <input type="date" name="start" value="{{.StartDate}}" required></label>
+  <label>End <input type="date" name="end" value="{{.EndDate}}" required></label>
+  <button>Generate labor report</button>
+</form>
+{{if .Complete}}
+  <section class="overview-grid">
+    {{range .LaborSummary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em></article>{{end}}
+  </section>
+{{else}}
+  <section class="notice bad">
+    <strong>Labor data is incomplete for this range.</strong>
+    <p>Missing required non-Sunday dates: {{range .MissingDates}}<code>{{formatISODate .}}</code> {{end}}</p>
+  </section>
+{{end}}
+<section>
+  <h2>Labor by day</h2>
+  <table>
+    <thead><tr><th>Date</th><th>Day</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th></tr></thead>
+    <tbody>{{range .DailyLaborRows}}<tr><td>{{.DateLabel}}</td><td>{{.Weekday}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="5">No labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section>
+  <h2>Labor by day of week</h2>
+  <table>
+    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .LaborDayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="6">No day labor found.</td></tr>{{end}}</tbody>
+  </table>
+</section>
+<section class="split">
+  <div>
+    <h2>Labor by role</h2>
+    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody></table>
+  </div>
+  <div>
+    <h2>Labor by department</h2>
+    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody></table>
+  </div>
+</section>
+<section>
+  <h2>Labor by job</h2>
+  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody></table>
+</section>
 <form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
-  <label>Time punch report
+  <label>Analyze a time punch report
     <input type="file" name="time_punch" accept=".pdf" required>
   </label>
   <button>Analyze labor</button>
@@ -4833,8 +5432,8 @@ const laborHTML = `{{define "body"}}
 <section>
   <h2>Labor by day of week</h2>
   <table>
-    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No day labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="6">No day labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
@@ -4944,7 +5543,7 @@ const rolesHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/sales">Sales</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
-  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor</a>
   <a href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
 </nav>
@@ -4989,7 +5588,7 @@ const departmentsHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/sales">Sales</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
-  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
   <a href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
 </nav>
@@ -5069,6 +5668,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand{font-weight:800}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

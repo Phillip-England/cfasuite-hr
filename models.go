@@ -79,9 +79,12 @@ type CalendarDay struct {
 	CurrentMonth  bool
 	Today         bool
 	HasSales      bool
+	HasLabor      bool
 	SalesRequired bool
+	LaborRequired bool
 	Complete      bool
 	Sunday        bool
+	Accessible    bool
 }
 
 type Role struct {
@@ -191,15 +194,17 @@ type LaborEmployee struct {
 }
 
 type LaborDay struct {
-	Weekday    string
-	Date       string
-	Minutes    int
-	WagesCents int64
+	Weekday         string
+	Date            string
+	Minutes         int
+	OvertimeMinutes int
+	WagesCents      int64
 }
 
 type LaborTotals struct {
-	Minutes    int
-	WagesCents int64
+	Minutes         int
+	OvertimeMinutes int
+	WagesCents      int64
 }
 
 type LaborSummary struct {
@@ -221,9 +226,35 @@ type LaborEmployeeRow struct {
 }
 
 type LaborDayRow struct {
-	Day     string
-	Date    string
-	Hours   string
-	Dollars string
-	Percent string
+	Day           string
+	Date          string
+	Hours         string
+	OvertimeHours string
+	Dollars       string
+	Percent       string
+}
+
+type DailyLabor struct {
+	LocationID      int64
+	BusinessDate    string
+	TotalMinutes    int
+	OvertimeMinutes int
+	TotalWagesCents int64
+	Roles           map[string]LaborTotals
+	Departments     map[string]LaborTotals
+	Jobs            map[string]LaborTotals
+	Employees       map[string]LaborTotals
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+type LaborDailyRow struct {
+	Date          string
+	DateLabel     string
+	Weekday       string
+	Hours         string
+	OvertimeHours string
+	Dollars       string
+	MinutesValue  int
+	CentsValue    int64
 }

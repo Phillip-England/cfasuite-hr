@@ -1650,6 +1650,7 @@ func templateFuncs() template.FuncMap {
 		},
 		"formatHours":        formatHours,
 		"formatISODate":      formatISODate,
+		"calendarDayPath":    calendarDayPath,
 		"salesRowsForLabels": salesRowsForLabels,
 		"salesDayparts": func() []string {
 			return salesDayparts
@@ -4131,6 +4132,10 @@ func formatISODate(value string) string {
 	return date.Format("Monday, January 2, 2006")
 }
 
+func calendarDayPath(locationID int64, date string) string {
+	return fmt.Sprintf("/locations/%d/calendar/%s", locationID, date)
+}
+
 func titleWeekday(value string) string {
 	switch strings.ToLower(value) {
 	case "mon":
@@ -5407,37 +5412,9 @@ const laborHTML = `{{define "body"}}
 {{else}}
   <section class="notice bad">
     <strong>Labor data is incomplete for this range.</strong>
-    <p>Missing required non-Sunday dates: {{range .MissingDates}}<code>{{formatISODate .}}</code> {{end}}</p>
+    <p>Missing required non-Sunday dates: {{range .MissingDates}}<a class="button small secondary" href="{{calendarDayPath $.SelectedLocation.ID .}}">{{formatISODate .}}</a> {{end}}</p>
   </section>
 {{end}}
-<section>
-  <h2>Labor by day</h2>
-  <table>
-    <thead><tr><th>Date</th><th>Day</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody>{{range .DailyLaborRows}}<tr><td>{{.DateLabel}}</td><td>{{.Weekday}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No labor found.</td></tr>{{end}}</tbody>
-  </table>
-</section>
-<section>
-  <h2>Labor by day of week</h2>
-  <table>
-    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .LaborDayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No day labor found.</td></tr>{{end}}</tbody>
-  </table>
-</section>
-<section class="split">
-  <div>
-    <h2>Labor by role</h2>
-    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody></table>
-  </div>
-  <div>
-    <h2>Labor by department</h2>
-    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody></table>
-  </div>
-</section>
-<section>
-  <h2>Labor by job</h2>
-  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody></table>
-</section>
 <form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
   <label>Analyze a time punch report
     <input type="file" name="time_punch" accept=".pdf" required>

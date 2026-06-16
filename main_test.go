@@ -1051,6 +1051,9 @@ func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	if !days[13].HasSales {
 		t.Fatal("expected June 13 to show imported sales")
 	}
+	if !days[7].Sunday || days[7].SalesRequired || !days[7].Complete {
+		t.Fatalf("expected current-month Sunday to be complete without required sales: %#v", days[7])
+	}
 	if days[0].SalesRequired {
 		t.Fatal("expected outside-month day to not require sales")
 	}

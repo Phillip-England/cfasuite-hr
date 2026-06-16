@@ -74,11 +74,14 @@ type AssignmentStatus struct {
 
 type CalendarDay struct {
 	Date          string
+	Label         string
 	Day           int
 	CurrentMonth  bool
 	Today         bool
 	HasSales      bool
 	SalesRequired bool
+	Complete      bool
+	Sunday        bool
 }
 
 type Role struct {
@@ -157,6 +160,7 @@ type SalesBreakdownRow struct {
 
 type SalesDailyRow struct {
 	Date         string
+	DateLabel    string
 	Weekday      string
 	TotalCents   int64
 	Dayparts     []SalesBreakdownRow

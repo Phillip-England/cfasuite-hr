@@ -529,14 +529,14 @@ func TestParsePinsPDF(t *testing.T) {
 	if len(pins) < 80 {
 		t.Fatalf("expected sample PIN report employees to parse, got %d", len(pins))
 	}
-	if pins[0].Name != "Aguirre, Angel" || pins[0].ClockInPIN != "99129" || pins[0].SignInPIN != "99129" {
+	if pins[0].Name != "Aguirre, Angel" || pins[0].ClockInPIN != "99129" {
 		t.Fatalf("unexpected first PIN row: %#v", pins[0])
 	}
 	var foundTeamMember bool
 	for _, pin := range pins {
 		if pin.Name == "Barbour, Sullivan" {
 			foundTeamMember = true
-			if pin.ClockInPIN != "721506" || pin.SignInPIN != "" {
+			if pin.ClockInPIN != "721506" {
 				t.Fatalf("unexpected team member PIN row: %#v", pin)
 			}
 		}
@@ -591,15 +591,54 @@ func TestImportPinsUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getEmployee: %v", err)
 	}
-	if employee.ClockInPIN == nil || *employee.ClockInPIN != "99129" || employee.SignInPIN == nil || *employee.SignInPIN != "99129" {
-		t.Fatalf("PINs were not imported: %#v", employee)
+	if employee.ClockInPIN == nil || *employee.ClockInPIN != "99129" {
+		t.Fatalf("clock-in PIN was not imported: %#v", employee)
 	}
 	otherEmployee, err := getEmployee(db, otherLocationID, "2")
 	if err != nil {
 		t.Fatalf("get other employee: %v", err)
 	}
-	if otherEmployee.ClockInPIN != nil || otherEmployee.SignInPIN != nil {
+	if otherEmployee.ClockInPIN != nil {
 		t.Fatalf("PIN import crossed location boundary: %#v", otherEmployee)
+	}
+}
+
+func TestMatchPinEmployeeIDHandlesReportNameVariants(t *testing.T) {
+	employees := []pinImportEmployee{
+		{ID: 1, Name: "Angeles Escobar, James M"},
+		{ID: 2, Name: "Baker, Ramond Manley (Ray)"},
+		{ID: 3, Name: "Boone, Zion J"},
+		{ID: 4, Name: "De La Cruz, Stephanie A"},
+		{ID: 5, Name: "De Leon, Maria V. (Vanessa)"},
+	}
+	for i := range employees {
+		employees[i].Keys = pinNameKeys(employees[i].Name)
+	}
+	cases := map[string]int64{
+		"Angeles Escobar, James":   1,
+		"Baker, Ramond (Ray)":      2,
+		"Boone, Zion":              3,
+		"De La Cruz, Stephanie":    4,
+		"De Leon, Maria (Vanessa)": 5,
+	}
+	for reportName, wantID := range cases {
+		gotID, ok := matchPinEmployeeID(employees, reportName)
+		if !ok || gotID != wantID {
+			t.Fatalf("matchPinEmployeeID(%q) = %d, %v; want %d, true", reportName, gotID, ok, wantID)
+		}
+	}
+}
+
+func TestMatchPinEmployeeIDSkipsAmbiguousNames(t *testing.T) {
+	employees := []pinImportEmployee{
+		{ID: 1, Name: "Smith, John A"},
+		{ID: 2, Name: "Smith, John B"},
+	}
+	for i := range employees {
+		employees[i].Keys = pinNameKeys(employees[i].Name)
+	}
+	if gotID, ok := matchPinEmployeeID(employees, "Smith, John"); ok || gotID != 0 {
+		t.Fatalf("ambiguous name matched employee %d", gotID)
 	}
 }
 
@@ -943,7 +982,6 @@ func TestAdminTemplatesRender(t *testing.T) {
 					LocationLatestStartDate: "2024-10-01",
 					BirthDate:               stringPtr("1999-03-14"),
 					ClockInPIN:              stringPtr("99129"),
-					SignInPIN:               stringPtr("99129"),
 				}},
 				"Import": url.Values{},
 			},

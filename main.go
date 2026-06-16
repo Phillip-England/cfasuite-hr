@@ -309,7 +309,6 @@ func migrate(db *sql.DB) error {
 			location_latest_start_date TEXT NOT NULL,
 			birth_date TEXT,
 			clock_in_pin TEXT,
-			sign_in_pin TEXT,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(location_id, employee_number)
@@ -354,9 +353,6 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "clock_in_pin", "TEXT"); err != nil {
-		return err
-	}
-	if err := ensureColumn(db, "employees", "sign_in_pin", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -1662,7 +1658,7 @@ func assignEmployeeWage(db *sql.DB, locationID int64, employeeIDs []int64, wageR
 }
 
 func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.sign_in_pin, e.created_at, e.updated_at
+	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1684,7 +1680,7 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.sign_in_pin, e.created_at, e.updated_at
+	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1708,8 +1704,7 @@ func scanEmployee(row scanner) (Employee, error) {
 	var wagePayType sql.NullString
 	var excludeFromLabor int
 	var clockInPIN sql.NullString
-	var signInPIN sql.NullString
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &clockInPIN, &signInPIN, &created, &updated)
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &clockInPIN, &created, &updated)
 	if roleID.Valid {
 		e.RoleID = &roleID.Int64
 	}
@@ -1734,9 +1729,6 @@ func scanEmployee(row scanner) (Employee, error) {
 	}
 	if clockInPIN.Valid {
 		e.ClockInPIN = &clockInPIN.String
-	}
-	if signInPIN.Valid {
-		e.SignInPIN = &signInPIN.String
 	}
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
@@ -1891,13 +1883,18 @@ func importPins(db *sql.DB, locationID int64, file multipart.File, header *multi
 		return ImportResult{}, err
 	}
 	defer tx.Rollback()
+	employees, err := employeePinImportIndex(tx, locationID)
+	if err != nil {
+		return ImportResult{}, err
+	}
 	result := ImportResult{}
 	for _, pin := range pins {
-		var signIn any
-		if pin.SignInPIN != "" {
-			signIn = pin.SignInPIN
+		employeeID, ok := matchPinEmployeeID(employees, pin.Name)
+		if !ok {
+			result.Skipped++
+			continue
 		}
-		res, err := tx.Exec(`UPDATE employees SET clock_in_pin = ?, sign_in_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND employee_name = ?`, pin.ClockInPIN, signIn, locationID, pin.Name)
+		res, err := tx.Exec(`UPDATE employees SET clock_in_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, pin.ClockInPIN, locationID, employeeID)
 		if err != nil {
 			return ImportResult{}, err
 		}
@@ -1909,6 +1906,52 @@ func importPins(db *sql.DB, locationID int64, file multipart.File, header *multi
 		result.Updated += int(affected)
 	}
 	return result, tx.Commit()
+}
+
+type pinImportEmployee struct {
+	ID   int64
+	Name string
+	Keys map[string]bool
+}
+
+func employeePinImportIndex(tx *sql.Tx, locationID int64) ([]pinImportEmployee, error) {
+	rows, err := tx.Query(`SELECT id, employee_name FROM employees WHERE location_id = ?`, locationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var employees []pinImportEmployee
+	for rows.Next() {
+		var employee pinImportEmployee
+		if err := rows.Scan(&employee.ID, &employee.Name); err != nil {
+			return nil, err
+		}
+		employee.Keys = pinNameKeys(employee.Name)
+		employees = append(employees, employee)
+	}
+	return employees, rows.Err()
+}
+
+func matchPinEmployeeID(employees []pinImportEmployee, reportName string) (int64, bool) {
+	reportKeys := pinNameKeys(reportName)
+	var matchedID int64
+	matches := 0
+	for _, employee := range employees {
+		for key := range reportKeys {
+			if employee.Keys[key] {
+				matchedID = employee.ID
+				matches++
+				break
+			}
+		}
+		if matches > 1 {
+			return 0, false
+		}
+	}
+	if matches != 1 {
+		return 0, false
+	}
+	return matchedID, true
 }
 
 func parseBio(data []byte) ([]BioEmployee, error) {
@@ -2022,7 +2065,6 @@ func parsePinsText(text string) ([]PinEmployee, error) {
 		employee := PinEmployee{Name: name, ClockInPIN: lines[i+2]}
 		i += 2
 		if i+1 < len(lines) && isPinValue(lines[i+1]) {
-			employee.SignInPIN = lines[i+1]
 			i++
 		}
 		pins = append(pins, employee)
@@ -2031,6 +2073,101 @@ func parsePinsText(text string) ([]PinEmployee, error) {
 		return nil, errors.New("no employee PIN rows found")
 	}
 	return pins, nil
+}
+
+func pinNameKeys(name string) map[string]bool {
+	keys := map[string]bool{}
+	all := compactNameKey(nameTokens(name))
+	if all != "" {
+		keys[all] = true
+	}
+	noInitials := compactNameKey(removeInitialTokens(nameTokens(name)))
+	if noInitials != "" {
+		keys[noInitials] = true
+	}
+	last, given, ok := splitCommaName(name)
+	if !ok {
+		return keys
+	}
+	lastTokens := removeInitialTokens(nameTokens(last))
+	givenWithoutNickname := removeParenthetical(given)
+	givenTokens := removeInitialTokens(nameTokens(givenWithoutNickname))
+	nicknameTokens := removeInitialTokens(parentheticalNameTokens(given))
+	addPinNameKey(keys, appendNameTokens(lastTokens, givenTokens...))
+	addPinNameKey(keys, appendNameTokens(appendNameTokens(lastTokens, givenTokens...), nicknameTokens...))
+	if len(givenTokens) > 0 {
+		addPinNameKey(keys, appendNameTokens(lastTokens, givenTokens[0]))
+		addPinNameKey(keys, appendNameTokens(appendNameTokens(lastTokens, givenTokens[0]), nicknameTokens...))
+	}
+	return keys
+}
+
+func addPinNameKey(keys map[string]bool, tokens []string) {
+	if key := compactNameKey(tokens); key != "" {
+		keys[key] = true
+	}
+}
+
+func splitCommaName(name string) (string, string, bool) {
+	parts := strings.SplitN(name, ",", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), true
+}
+
+func nameTokens(value string) []string {
+	value = strings.ToLower(value)
+	value = strings.ReplaceAll(value, ".", " ")
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte(' ')
+	}
+	return strings.Fields(b.String())
+}
+
+func parentheticalNameTokens(value string) []string {
+	matches := parentheticalNameRe.FindAllStringSubmatch(value, -1)
+	var tokens []string
+	for _, match := range matches {
+		if len(match) > 1 {
+			tokens = append(tokens, nameTokens(match[1])...)
+		}
+	}
+	return tokens
+}
+
+func removeParenthetical(value string) string {
+	return parentheticalNameRe.ReplaceAllString(value, " ")
+}
+
+func removeInitialTokens(tokens []string) []string {
+	filtered := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		if len(token) == 1 {
+			continue
+		}
+		filtered = append(filtered, token)
+	}
+	return filtered
+}
+
+func appendNameTokens(tokens []string, values ...string) []string {
+	combined := make([]string, 0, len(tokens)+len(values))
+	combined = append(combined, tokens...)
+	combined = append(combined, values...)
+	return combined
+}
+
+func compactNameKey(tokens []string) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	return strings.Join(tokens, " ")
 }
 
 func cleanPinLines(text string) []string {
@@ -2971,8 +3108,8 @@ Important data rules:
 - exclude_from_labor is location-specific and means the employee is omitted from that location's Labor Board calculations.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
 - Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
-- clock_in_pin and sign_in_pin are strings from the location PIN report, or null when no PIN has been imported for that employee.
-- PIN reports are uploaded for one location and match employees at that location by exact Employee Name.
+- clock_in_pin is a string from the location PIN report, or null when no PIN has been imported for that employee.
+- PIN reports are uploaded for one location and match employees at that location by normalized Employee Name, allowing omitted middle names or initials.
 
 Endpoints:
 GET /api/v1/locations
@@ -3015,7 +3152,6 @@ Example response:
       "location_latest_start_date": "2024-10-01",
       "birth_date": "1999-03-14",
       "clock_in_pin": "99129",
-      "sign_in_pin": "99129",
       "created_at": "2026-06-13T12:00:00Z",
       "updated_at": "2026-06-13T12:00:00Z"
     }
@@ -3063,7 +3199,6 @@ type Employee struct {
 	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
 	BirthDate               *string `+"`json:\"birth_date\"`"+`
 	ClockInPIN              *string `+"`json:\"clock_in_pin\"`"+`
-	SignInPIN               *string `+"`json:\"sign_in_pin\"`"+`
 }
 
 func Employees(baseURL, token, storeNumber string) ([]Employee, error) {
@@ -3196,6 +3331,7 @@ var (
 	grandTotalsInlineRe    = regexp.MustCompile(`\s*All Employees Grand Total\s*`)
 	moneyThenEmployeeRe    = regexp.MustCompile(`(\$[\d,]+\.\d{2})\s*([A-Z][A-Za-z .'\-/()]+,\s)`)
 	weekdayInlineRe        = regexp.MustCompile(`\s+(Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s*`)
+	parentheticalNameRe    = regexp.MustCompile(`\(([^)]*)\)`)
 )
 
 func env(key, fallback string) string {
@@ -3486,10 +3622,10 @@ const locationDetailsHTML = `{{define "body"}}
     </label>
   </div>
   <table>
-    <thead><tr><th>Name</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th><th>Sign-in PIN</th></tr></thead>
+    <thead><tr><th>Name</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th></tr></thead>
     <tbody id="employee-detail-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td><td>{{if .SignInPIN}}{{.SignInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
-    <tr id="employee-detail-empty" hidden><td colspan="5">No employees match this filter.</td></tr>
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
+    <tr id="employee-detail-empty" hidden><td colspan="4">No employees match this filter.</td></tr>
     </tbody>
   </table>
 </section>
@@ -3647,7 +3783,7 @@ const locationDocumentsHTML = `{{define "body"}}
   </form>
   <form method="post" action="/locations/{{.Location.ID}}/pins/upload" enctype="multipart/form-data" class="panel">
     <h2>Upload PIN report</h2>
-    <p class="muted">This applies clock-in and sign-in PINs only to matching employees at this location.</p>
+    <p class="muted">This applies clock-in PINs only to matching employees at this location.</p>
     <input type="file" name="pins" accept=".pdf" required>
     <button>Upload PINs</button>
   </form>
@@ -3946,7 +4082,7 @@ const docsHTML = `{{define "body"}}
 </section>
 <section class="panel">
   <h2>Employee PINs</h2>
-  <p>PINs are imported from a location PIN report PDF with employee name, access level, clock-in PIN, and sign-in PIN columns. The importer matches current employees at that location by exact employee name.</p>
+  <p>Clock-in PINs are imported from a location PIN report PDF with employee name, access level, clock-in PIN, and sign-in PIN columns. The importer ignores sign-in PINs and matches current employees at that location using normalized employee names.</p>
 </section>
 <section>
   <h2>LLM context and Go example</h2>

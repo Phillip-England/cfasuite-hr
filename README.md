@@ -95,7 +95,7 @@ The importer matches birthdays to current employees at the selected location by 
 
 Open a location in the admin UI, then upload the location PIN report `.pdf`. The report should include employee name, access level, clock-in PIN, and sign-in PIN columns.
 
-The importer ignores access level and matches PINs to current employees at the selected location by exact employee name. New employees from the employee bio import keep `clock_in_pin` and `sign_in_pin` as `null` until a matching PIN report is uploaded.
+The importer ignores access level and sign-in PINs. It matches clock-in PINs to current employees at the selected location by normalized employee name, allowing the PIN report to omit middle names or initials. New employees from the employee bio import keep `clock_in_pin` as `null` until a matching PIN report is uploaded.
 
 ## API
 
@@ -125,7 +125,7 @@ Employee responses include:
 - `employee_status`
 - `location_latest_start_date`
 - `birth_date` as `YYYY-MM-DD` or `null`
-- `clock_in_pin` and `sign_in_pin` as strings or `null`
+- `clock_in_pin` as a string or `null`
 
 Example:
 

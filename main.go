@@ -3086,12 +3086,11 @@ func aggregateStoredLaborRows(labor []DailyLabor, groupType string) []LaborEmplo
 	for _, label := range labels {
 		total := totals[label]
 		row := LaborEmployeeRow{
-			Hours:           formatHours(total.Minutes),
-			Dollars:         formatDollars(total.WagesCents),
-			OvertimeDollars: formatDollars(total.OvertimeWagesCents),
-			Percent:         formatPercent(total.WagesCents, grand.WagesCents),
-			MinutesValue:    total.Minutes,
-			CentsValue:      total.WagesCents,
+			Hours:        formatHours(total.Minutes),
+			Dollars:      formatDollars(total.WagesCents),
+			Percent:      formatPercent(total.WagesCents, grand.WagesCents),
+			MinutesValue: total.Minutes,
+			CentsValue:   total.WagesCents,
 		}
 		switch groupType {
 		case "role":
@@ -3108,9 +3107,12 @@ func aggregateStoredLaborRows(labor []DailyLabor, groupType string) []LaborEmplo
 
 func storedLaborSummary(labor []DailyLabor) []LaborSummary {
 	total := sumStoredLabor(labor)
+	regularMinutes := total.Minutes - total.OvertimeMinutes
+	regularWages := total.WagesCents - total.OvertimeWagesCents
 	return []LaborSummary{
-		{Label: "Hours", Hours: formatHours(total.Minutes), Dollars: "Overtime " + formatHours(total.OvertimeMinutes)},
-		{Label: "Labor dollars", Hours: formatDollars(total.WagesCents), Dollars: strconv.Itoa(len(labor)) + " imported days"},
+		{Label: "Hours", Hours: formatHours(total.Minutes), Dollars: "Regular " + formatHours(regularMinutes), Detail: "Overtime " + formatHours(total.OvertimeMinutes)},
+		{Label: "Labor dollars", Hours: formatDollars(total.WagesCents), Dollars: "Regular " + formatDollars(regularWages), Detail: "Overtime " + formatDollars(total.OvertimeWagesCents)},
+		{Label: "Imported days", Hours: strconv.Itoa(len(labor)), Dollars: "Completed labor days"},
 	}
 }
 
@@ -3805,8 +3807,11 @@ func salaryLaborDays(startDate, endDate string, monthlyCents int64) []LaborDay {
 }
 
 func laborSummary(report TimePunchReport) []LaborSummary {
+	regularMinutes := report.GrandTotals.Minutes - report.GrandTotals.OvertimeMinutes
+	regularWages := report.GrandTotals.WagesCents - report.GrandTotals.OvertimeWagesCents
 	return []LaborSummary{
-		{Label: "Total week", Hours: formatHours(report.GrandTotals.Minutes), Dollars: formatDollars(report.GrandTotals.WagesCents)},
+		{Label: "Total week", Hours: formatHours(report.GrandTotals.Minutes), Dollars: "Regular " + formatHours(regularMinutes), Detail: "Overtime " + formatHours(report.GrandTotals.OvertimeMinutes)},
+		{Label: "Labor dollars", Hours: formatDollars(report.GrandTotals.WagesCents), Dollars: "Regular " + formatDollars(regularWages), Detail: "Overtime " + formatDollars(report.GrandTotals.OvertimeWagesCents)},
 		{Label: "Employees", Hours: strconv.Itoa(len(report.Employees)), Dollars: report.PeriodLabel},
 	}
 }
@@ -3864,15 +3869,14 @@ func laborEmployeeRows(report TimePunchReport) []LaborEmployeeRow {
 	rows := make([]LaborEmployeeRow, 0, len(employees))
 	for _, employee := range employees {
 		rows = append(rows, LaborEmployeeRow{
-			Name:            employee.Name,
-			Job:             employee.Job,
-			Role:            employee.Role,
-			Department:      employee.Department,
-			Hours:           formatHours(employee.Totals.Minutes),
-			Dollars:         formatDollars(employee.Totals.WagesCents),
-			OvertimeDollars: formatDollars(employee.Totals.OvertimeWagesCents),
-			MinutesValue:    employee.Totals.Minutes,
-			CentsValue:      employee.Totals.WagesCents,
+			Name:         employee.Name,
+			Job:          employee.Job,
+			Role:         employee.Role,
+			Department:   employee.Department,
+			Hours:        formatHours(employee.Totals.Minutes),
+			Dollars:      formatDollars(employee.Totals.WagesCents),
+			MinutesValue: employee.Totals.Minutes,
+			CentsValue:   employee.Totals.WagesCents,
 		})
 	}
 	return rows
@@ -3959,12 +3963,11 @@ func laborGroupRows(report TimePunchReport, group string) []LaborEmployeeRow {
 	sortable := make([]groupRow, 0, len(byGroup))
 	for key, total := range byGroup {
 		row := LaborEmployeeRow{
-			Hours:           formatHours(total.minutes),
-			Dollars:         formatDollars(total.cents),
-			OvertimeDollars: formatDollars(total.overtimeCents),
-			Percent:         formatPercent(total.cents, report.GrandTotals.WagesCents),
-			MinutesValue:    total.minutes,
-			CentsValue:      total.cents,
+			Hours:        formatHours(total.minutes),
+			Dollars:      formatDollars(total.cents),
+			Percent:      formatPercent(total.cents, report.GrandTotals.WagesCents),
+			MinutesValue: total.minutes,
+			CentsValue:   total.cents,
 		}
 		switch group {
 		case "role":
@@ -5399,7 +5402,7 @@ const laborHTML = `{{define "body"}}
 </form>
 {{if .Complete}}
   <section class="overview-grid">
-    {{range .LaborSummary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em></article>{{end}}
+    {{range .LaborSummary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em>{{if .Detail}}<em>{{.Detail}}</em>{{end}}</article>{{end}}
   </section>
 {{else}}
   <section class="notice bad">
@@ -5410,30 +5413,30 @@ const laborHTML = `{{define "body"}}
 <section>
   <h2>Labor by day</h2>
   <table>
-    <thead><tr><th>Date</th><th>Day</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th></tr></thead>
-    <tbody>{{range .DailyLaborRows}}<tr><td>{{.DateLabel}}</td><td>{{.Weekday}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="5">No labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Date</th><th>Day</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody>{{range .DailyLaborRows}}<tr><td>{{.DateLabel}}</td><td>{{.Weekday}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="4">No labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by day of week</h2>
   <table>
-    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .LaborDayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="6">No day labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .LaborDayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No day labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section class="split">
   <div>
     <h2>Labor by role</h2>
-    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No role labor found.</td></tr>{{end}}</tbody></table>
+    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody></table>
   </div>
   <div>
     <h2>Labor by department</h2>
-    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No department labor found.</td></tr>{{end}}</tbody></table>
+    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody></table>
   </div>
 </section>
 <section>
   <h2>Labor by job</h2>
-  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No job labor found.</td></tr>{{end}}</tbody></table>
+  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody></table>
 </section>
 <form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
   <label>Analyze a time punch report
@@ -5449,35 +5452,35 @@ const laborHTML = `{{define "body"}}
     {{if .Report.PeriodLabel}}<p class="muted">{{.Report.PeriodLabel}}</p>{{end}}
   </div>
   <div class="summary-grid">
-    {{range .Summary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em></article>{{end}}
+    {{range .Summary}}<article class="metric"><span>{{.Label}}</span><strong>{{.Hours}}</strong><em>{{.Dollars}}</em>{{if .Detail}}<em>{{.Detail}}</em>{{end}}</article>{{end}}
   </div>
 </section>
 <section>
   <h2>Labor by day of week</h2>
   <table>
-    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Overtime</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.OvertimeHours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="6">No day labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Day</th><th>Dates included</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DayRows}}<tr><td>{{.Day}}</td><td>{{.Date}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No day labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by role</h2>
   <table>
-    <thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .RoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No role labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .RoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by department</h2>
   <table>
-    <thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .DepartmentRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No department labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DepartmentRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by job</h2>
   <table>
-    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No job labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section id="employee-labor">
@@ -5506,8 +5509,8 @@ const laborHTML = `{{define "body"}}
     </div>
   </div>
   <table>
-    <thead><tr><th>Employee</th><th>Role</th><th>Department</th><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th></tr></thead>
-    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Role}}</td><td>{{.Department}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td></tr>{{else}}<tr><td colspan="7">No employee labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Employee</th><th>Role</th><th>Department</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
+    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Role}}</td><td>{{.Department}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="6">No employee labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <script>

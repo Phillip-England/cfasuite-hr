@@ -832,13 +832,9 @@ Tue, 05/12/2026 8:00a 2:00p 6:00 Regular $15.00 6:00 $90.00 $90.00
 	if labor[0].Roles["Trainer"].WagesCents != 12000 || labor[0].Roles["Trainer"].OvertimeWagesCents != 4500 || labor[0].Jobs["Team Member"].Minutes != 420 {
 		t.Fatalf("expected stored breakdowns, got %#v", labor[0])
 	}
-	jobRows := aggregateStoredLaborRows(labor, "job")
-	if len(jobRows) != 1 || jobRows[0].OvertimeDollars != "$45.00" {
-		t.Fatalf("expected stored job overtime wages, got %#v", jobRows)
-	}
 }
 
-func TestLaborJobRowsShowsOvertimeWages(t *testing.T) {
+func TestLaborSummaryShowsRegularAndOvertimeTotals(t *testing.T) {
 	report, err := parseTimePunchText(`Employee Time Detail
 Store
 From Monday, May 11, 2026 through Monday, May 11, 2026
@@ -849,10 +845,15 @@ Mon, 05/11/2026 1:00p 3:00p 2:00 Overtime $22.50 2:00 $45.00 $45.00
 	if err != nil {
 		t.Fatalf("parseTimePunchText: %v", err)
 	}
-	report.Employees[0].Job = "Team Member"
-	rows := laborJobRows(report)
-	if len(rows) != 1 || rows[0].Dollars != "$120.00" || rows[0].OvertimeDollars != "$45.00" {
-		t.Fatalf("expected job row to include overtime wages, got %#v", rows)
+	summary := laborSummary(report)
+	if len(summary) < 2 {
+		t.Fatalf("expected labor summary rows, got %#v", summary)
+	}
+	if summary[0].Hours != "7.00" || summary[0].Dollars != "Regular 5.00" || summary[0].Detail != "Overtime 2.00" {
+		t.Fatalf("expected regular and overtime hour summary, got %#v", summary[0])
+	}
+	if summary[1].Hours != "$120.00" || summary[1].Dollars != "Regular $75.00" || summary[1].Detail != "Overtime $45.00" {
+		t.Fatalf("expected regular and overtime dollar summary, got %#v", summary[1])
 	}
 }
 

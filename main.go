@@ -3486,10 +3486,10 @@ const locationDetailsHTML = `{{define "body"}}
     </label>
   </div>
   <table>
-    <thead><tr><th>Name</th><th>Employee #</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th><th>Sign-in PIN</th></tr></thead>
+    <thead><tr><th>Name</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th><th>Sign-in PIN</th></tr></thead>
     <tbody id="employee-detail-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td><td>{{if .SignInPIN}}{{.SignInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
-    <tr id="employee-detail-empty" hidden><td colspan="6">No employees match this filter.</td></tr>
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td><td>{{if .SignInPIN}}{{.SignInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    <tr id="employee-detail-empty" hidden><td colspan="5">No employees match this filter.</td></tr>
     </tbody>
   </table>
 </section>
@@ -3536,10 +3536,10 @@ const locationPayHTML = `{{define "body"}}
     </label>
   </div>
   <table>
-    <thead><tr><th>Name</th><th>Employee #</th><th>Pay type</th><th>Wage</th><th>Exclude labor</th></tr></thead>
+    <thead><tr><th>Name</th><th>Pay type</th><th>Wage</th><th>Exclude labor</th></tr></thead>
     <tbody id="employee-pay-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
-    <tr id="employee-pay-empty" hidden><td colspan="5">No employees match this filter.</td></tr>
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
+    <tr id="employee-pay-empty" hidden><td colspan="4">No employees match this filter.</td></tr>
     </tbody>
   </table>
 </section>

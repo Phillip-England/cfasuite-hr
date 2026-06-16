@@ -2059,7 +2059,7 @@ func parsePinsText(text string) ([]PinEmployee, error) {
 		if isPinHeader(name) || isPinValue(name) {
 			continue
 		}
-		if i+2 >= len(lines) || !isAccessLevel(lines[i+1]) || !isPinValue(lines[i+2]) {
+		if i+2 >= len(lines) || !isPinGroupLine(lines[i+1]) || !isPinValue(lines[i+2]) {
 			continue
 		}
 		employee := PinEmployee{Name: name, ClockInPIN: lines[i+2]}
@@ -2191,13 +2191,9 @@ func isPinHeader(value string) bool {
 	}
 }
 
-func isAccessLevel(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "cashier", "manager", "team member":
-		return true
-	default:
-		return false
-	}
+func isPinGroupLine(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !isPinHeader(value) && !isPinValue(value)
 }
 
 func isPinValue(value string) bool {

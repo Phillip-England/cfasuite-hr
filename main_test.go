@@ -603,6 +603,32 @@ func TestImportPinsUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	}
 }
 
+func TestParsePinsTextAcceptsUnknownEmployeeGroups(t *testing.T) {
+	pins, err := parsePinsText(`Full Name
+Employee Group
+Clock-In PIN
+Sign-In PIN
+Vasquez, Rafael
+Kitchen Lead
+123456
+123456`)
+	if err != nil {
+		t.Fatalf("parsePinsText: %v", err)
+	}
+	if len(pins) != 1 || pins[0].Name != "Vasquez, Rafael" || pins[0].ClockInPIN != "123456" {
+		t.Fatalf("unexpected PIN rows: %#v", pins)
+	}
+}
+
+func TestMatchPinEmployeeIDHandlesExactReportName(t *testing.T) {
+	employees := []pinImportEmployee{{ID: 1, Name: "Vasquez, Rafael"}}
+	employees[0].Keys = pinNameKeys(employees[0].Name)
+	gotID, ok := matchPinEmployeeID(employees, "Vasquez, Rafael")
+	if !ok || gotID != 1 {
+		t.Fatalf("matchPinEmployeeID returned %d, %v; want 1, true", gotID, ok)
+	}
+}
+
 func TestMatchPinEmployeeIDHandlesReportNameVariants(t *testing.T) {
 	employees := []pinImportEmployee{
 		{ID: 1, Name: "Angeles Escobar, James M"},

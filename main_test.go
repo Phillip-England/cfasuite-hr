@@ -517,6 +517,92 @@ func TestImportBirthdaysUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	}
 }
 
+func TestParsePinsPDF(t *testing.T) {
+	data, err := os.ReadFile("pin.pdf")
+	if err != nil {
+		t.Skip("pin.pdf fixture is not present")
+	}
+	pins, err := parsePinsPDF(data)
+	if err != nil {
+		t.Fatalf("parsePinsPDF: %v", err)
+	}
+	if len(pins) < 80 {
+		t.Fatalf("expected sample PIN report employees to parse, got %d", len(pins))
+	}
+	if pins[0].Name != "Aguirre, Angel" || pins[0].ClockInPIN != "99129" || pins[0].SignInPIN != "99129" {
+		t.Fatalf("unexpected first PIN row: %#v", pins[0])
+	}
+	var foundTeamMember bool
+	for _, pin := range pins {
+		if pin.Name == "Barbour, Sullivan" {
+			foundTeamMember = true
+			if pin.ClockInPIN != "721506" || pin.SignInPIN != "" {
+				t.Fatalf("unexpected team member PIN row: %#v", pin)
+			}
+		}
+		if pin.Name == "Kyle Sutton" {
+			t.Fatalf("employee without a clock-in PIN should be skipped: %#v", pin)
+		}
+	}
+	if !foundTeamMember {
+		t.Fatal("expected Barbour, Sullivan to parse")
+	}
+}
+
+func TestImportPinsUpdatesMatchingEmployeesForLocation(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	otherLocationID, err := createLocation(db, "Northroads", "01234")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Aguirre, Angel", "1", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, otherLocationID, "Aguirre, Angel", "2", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert other employee: %v", err)
+	}
+	data, err := os.ReadFile("pin.pdf")
+	if err != nil {
+		t.Skip("pin.pdf fixture is not present")
+	}
+	result, err := importPins(db, locationID, multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "pins.pdf"})
+	if err != nil {
+		t.Fatalf("importPins: %v", err)
+	}
+	if result.Updated != 1 || result.Skipped == 0 {
+		t.Fatalf("unexpected import result: %#v", result)
+	}
+	employee, err := getEmployee(db, locationID, "1")
+	if err != nil {
+		t.Fatalf("getEmployee: %v", err)
+	}
+	if employee.ClockInPIN == nil || *employee.ClockInPIN != "99129" || employee.SignInPIN == nil || *employee.SignInPIN != "99129" {
+		t.Fatalf("PINs were not imported: %#v", employee)
+	}
+	otherEmployee, err := getEmployee(db, otherLocationID, "2")
+	if err != nil {
+		t.Fatalf("get other employee: %v", err)
+	}
+	if otherEmployee.ClockInPIN != nil || otherEmployee.SignInPIN != nil {
+		t.Fatalf("PIN import crossed location boundary: %#v", otherEmployee)
+	}
+}
+
 func TestParseTimePunchTextBuildsLaborRollups(t *testing.T) {
 	report, err := parseTimePunchText(`Employee Time Detail
 13th & Utica FSU
@@ -856,6 +942,27 @@ func TestAdminTemplatesRender(t *testing.T) {
 					EmployeeStatus:          "Active",
 					LocationLatestStartDate: "2024-10-01",
 					BirthDate:               stringPtr("1999-03-14"),
+					ClockInPIN:              stringPtr("99129"),
+					SignInPIN:               stringPtr("99129"),
+				}},
+				"Import": url.Values{},
+			},
+		},
+		{
+			name: "location pay",
+			body: locationPayHTML,
+			data: map[string]any{
+				"Title":    "Employee Pay",
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Employees": []Employee{{
+					ID:                      1,
+					EmployeeName:            "Blanco, John",
+					EmployeeNumber:          "12-1083836",
+					Job:                     "Team Member",
+					WageRateCents:           int64Ptr(1500),
+					WagePayType:             "hourly",
+					EmployeeStatus:          "Active",
+					LocationLatestStartDate: "2024-10-01",
 				}},
 				"Import": url.Values{},
 			},

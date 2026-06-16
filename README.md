@@ -91,6 +91,12 @@ Open a location in the admin UI, then upload the Employee Birthday Reader `.xlsx
 
 The importer matches birthdays to current employees at the selected location by exact employee name. It stores birthdays as `YYYY-MM-DD`. Employees that do not have a matching birthday report row keep `birth_date` as `null` in the API.
 
+## PIN Report Imports
+
+Open a location in the admin UI, then upload the location PIN report `.pdf`. The report should include employee name, access level, clock-in PIN, and sign-in PIN columns.
+
+The importer ignores access level and matches PINs to current employees at the selected location by exact employee name. New employees from the employee bio import keep `clock_in_pin` and `sign_in_pin` as `null` until a matching PIN report is uploaded.
+
 ## API
 
 Create an API token in the admin UI or CLI. Use either:
@@ -119,6 +125,7 @@ Employee responses include:
 - `employee_status`
 - `location_latest_start_date`
 - `birth_date` as `YYYY-MM-DD` or `null`
+- `clock_in_pin` and `sign_in_pin` as strings or `null`
 
 Example:
 

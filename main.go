@@ -308,6 +308,8 @@ func migrate(db *sql.DB) error {
 			employee_status TEXT NOT NULL,
 			location_latest_start_date TEXT NOT NULL,
 			birth_date TEXT,
+			clock_in_pin TEXT,
+			sign_in_pin TEXT,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(location_id, employee_number)
@@ -349,6 +351,12 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "exclude_from_labor", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "clock_in_pin", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "sign_in_pin", "TEXT"); err != nil {
 		return err
 	}
 	return nil
@@ -422,12 +430,14 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations", a.requireAdmin(a.locationCreate))
 	mux.HandleFunc("GET /locations/{id}", a.requireAdmin(a.locationShow))
 	mux.HandleFunc("GET /locations/{id}/details", a.requireAdmin(a.locationDetails))
+	mux.HandleFunc("GET /locations/{id}/pay", a.requireAdmin(a.locationPay))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
 	mux.HandleFunc("GET /locations/{id}/edit", a.requireAdmin(a.locationEdit))
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
 	mux.HandleFunc("POST /locations/{id}/upload", a.requireAdmin(a.locationUpload))
 	mux.HandleFunc("POST /locations/{id}/birthdays/upload", a.requireAdmin(a.birthdayUpload))
+	mux.HandleFunc("POST /locations/{id}/pins/upload", a.requireAdmin(a.pinUpload))
 	mux.HandleFunc("POST /locations/{id}/assignments", a.requireAdmin(a.locationAssignmentsUpdate))
 	mux.HandleFunc("POST /locations/{id}/roles", a.requireAdmin(a.locationRolesUpdate))
 	mux.HandleFunc("GET /locations/{id}/roles", a.requireAdmin(a.rolesPage))
@@ -577,6 +587,29 @@ func (a *App) locationDetails(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) locationPay(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employees, err := listEmployees(a.db, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name+" Employee Pay", locationPayHTML, map[string]any{
+		"Location":  loc,
+		"Employees": employees,
+		"Import":    r.URL.Query(),
+	})
+}
+
 func (a *App) locationDocuments(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -689,6 +722,35 @@ func (a *App) birthdayUpload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d/documents?birthday_updated=%d&birthday_skipped=%d", id, result.Updated, result.Skipped), http.StatusSeeOther)
 }
 
+func (a *App) pinUpload(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("pins")
+	if err != nil {
+		http.Error(w, "PIN report PDF file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	result, err := importPins(a.db, id, file, header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/documents?pin_updated=%d&pin_skipped=%d", id, result.Updated, result.Skipped), http.StatusSeeOther)
+}
+
 func (a *App) locationRolesUpdate(w http.ResponseWriter, r *http.Request) {
 	a.updateEmployeeRoleAssignments(w, r)
 }
@@ -753,7 +815,7 @@ func (a *App) updateEmployeeWages(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/locations/%d/details?wages_assigned=%d", id, updated), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/pay?wages_assigned=%d", id, updated), http.StatusSeeOther)
 }
 
 func (a *App) updateEmployeeLaborExclusion(w http.ResponseWriter, r *http.Request) {
@@ -791,7 +853,7 @@ func (a *App) updateEmployeeLaborExclusion(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/locations/%d/details?labor_exclusions=%d", id, updated), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/pay?labor_exclusions=%d", id, updated), http.StatusSeeOther)
 }
 
 func (a *App) updateEmployeeRoleAssignments(w http.ResponseWriter, r *http.Request) {
@@ -1600,7 +1662,7 @@ func assignEmployeeWage(db *sql.DB, locationID int64, employeeIDs []int64, wageR
 }
 
 func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.sign_in_pin, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1622,7 +1684,7 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.created_at, e.updated_at
+	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.sign_in_pin, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
 		LEFT JOIN departments d ON d.id = e.department_id
@@ -1645,7 +1707,9 @@ func scanEmployee(row scanner) (Employee, error) {
 	var wageRateCents sql.NullInt64
 	var wagePayType sql.NullString
 	var excludeFromLabor int
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &created, &updated)
+	var clockInPIN sql.NullString
+	var signInPIN sql.NullString
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &clockInPIN, &signInPIN, &created, &updated)
 	if roleID.Valid {
 		e.RoleID = &roleID.Int64
 	}
@@ -1667,6 +1731,12 @@ func scanEmployee(row scanner) (Employee, error) {
 	e.ExcludeFromLabor = excludeFromLabor != 0
 	if birthDate.Valid {
 		e.BirthDate = &birthDate.String
+	}
+	if clockInPIN.Valid {
+		e.ClockInPIN = &clockInPIN.String
+	}
+	if signInPIN.Valid {
+		e.SignInPIN = &signInPIN.String
 	}
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
@@ -1804,6 +1874,43 @@ func importBirthdays(db *sql.DB, locationID int64, file multipart.File, header *
 	return result, tx.Commit()
 }
 
+func importPins(db *sql.DB, locationID int64, file multipart.File, header *multipart.FileHeader) (ImportResult, error) {
+	if header != nil && !strings.HasSuffix(strings.ToLower(header.Filename), ".pdf") {
+		return ImportResult{}, errors.New("PIN report must be a PDF file")
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	pins, err := parsePinsPDF(data)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	defer tx.Rollback()
+	result := ImportResult{}
+	for _, pin := range pins {
+		var signIn any
+		if pin.SignInPIN != "" {
+			signIn = pin.SignInPIN
+		}
+		res, err := tx.Exec(`UPDATE employees SET clock_in_pin = ?, sign_in_pin = ?, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND employee_name = ?`, pin.ClockInPIN, signIn, locationID, pin.Name)
+		if err != nil {
+			return ImportResult{}, err
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			result.Skipped++
+			continue
+		}
+		result.Updated += int(affected)
+	}
+	return result, tx.Commit()
+}
+
 func parseBio(data []byte) ([]BioEmployee, error) {
 	f, err := excelize.OpenReader(bytes.NewReader(data))
 	if err != nil {
@@ -1883,6 +1990,89 @@ func parseBirthdays(data []byte) ([]BirthdayEmployee, error) {
 		birthdays = append(birthdays, BirthdayEmployee{Name: name, BirthDate: birthDate})
 	}
 	return birthdays, nil
+}
+
+func parsePinsPDF(data []byte) ([]PinEmployee, error) {
+	reader, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("read PDF: %w", err)
+	}
+	var text bytes.Buffer
+	plain, err := reader.GetPlainText()
+	if err != nil {
+		return nil, fmt.Errorf("extract PDF text: %w", err)
+	}
+	if _, err := io.Copy(&text, plain); err != nil {
+		return nil, err
+	}
+	return parsePinsText(text.String())
+}
+
+func parsePinsText(text string) ([]PinEmployee, error) {
+	lines := cleanPinLines(text)
+	var pins []PinEmployee
+	for i := 0; i < len(lines); i++ {
+		name := lines[i]
+		if isPinHeader(name) || isPinValue(name) {
+			continue
+		}
+		if i+2 >= len(lines) || !isAccessLevel(lines[i+1]) || !isPinValue(lines[i+2]) {
+			continue
+		}
+		employee := PinEmployee{Name: name, ClockInPIN: lines[i+2]}
+		i += 2
+		if i+1 < len(lines) && isPinValue(lines[i+1]) {
+			employee.SignInPIN = lines[i+1]
+			i++
+		}
+		pins = append(pins, employee)
+	}
+	if len(pins) == 0 {
+		return nil, errors.New("no employee PIN rows found")
+	}
+	return pins, nil
+}
+
+func cleanPinLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.ReplaceAll(line, "\f", " ")
+		cleaned := strings.Join(strings.Fields(line), " ")
+		if cleaned != "" {
+			lines = append(lines, cleaned)
+		}
+	}
+	return lines
+}
+
+func isPinHeader(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "full name", "employee group", "clock-in pin", "sign-in pin":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAccessLevel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "cashier", "manager", "team member":
+		return true
+	default:
+		return false
+	}
+}
+
+func isPinValue(value string) bool {
+	if len(value) < 4 || len(value) > 8 {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseTimePunchPDF(file multipart.File, header *multipart.FileHeader) (TimePunchReport, error) {
@@ -2760,7 +2950,7 @@ Base URL: %s
 
 Purpose:
 cfasuite-hr exposes Chick-fil-A restaurant locations and active employee records to other systems.
-Employee records come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files.
+Employee records come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files. PINs come from uploaded PIN report PDF files.
 Jobs come from the employee bio. Roles and departments are configured per location inside cfasuite-hr by the admin and assigned manually.
 
 Authentication:
@@ -2781,6 +2971,8 @@ Important data rules:
 - exclude_from_labor is location-specific and means the employee is omitted from that location's Labor Board calculations.
 - birth_date is ISO format YYYY-MM-DD when a birthday report matched the employee, and null when no birthday is known.
 - Birthday reports are uploaded for one location and match employees at that location by exact Employee Name.
+- clock_in_pin and sign_in_pin are strings from the location PIN report, or null when no PIN has been imported for that employee.
+- PIN reports are uploaded for one location and match employees at that location by exact Employee Name.
 
 Endpoints:
 GET /api/v1/locations
@@ -2822,6 +3014,8 @@ Example response:
       "employee_status": "Active",
       "location_latest_start_date": "2024-10-01",
       "birth_date": "1999-03-14",
+      "clock_in_pin": "99129",
+      "sign_in_pin": "99129",
       "created_at": "2026-06-13T12:00:00Z",
       "updated_at": "2026-06-13T12:00:00Z"
     }
@@ -2868,6 +3062,8 @@ type Employee struct {
 	EmployeeStatus          string `+"`json:\"employee_status\"`"+`
 	LocationLatestStartDate string `+"`json:\"location_latest_start_date\"`"+`
 	BirthDate               *string `+"`json:\"birth_date\"`"+`
+	ClockInPIN              *string `+"`json:\"clock_in_pin\"`"+`
+	SignInPIN               *string `+"`json:\"sign_in_pin\"`"+`
 }
 
 func Employees(baseURL, token, storeNumber string) ([]Employee, error) {
@@ -3107,6 +3303,7 @@ const locationShowHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a class="active" href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3256,6 +3453,7 @@ const locationDetailsHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a class="active" href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3280,8 +3478,6 @@ const locationDetailsHTML = `{{define "body"}}
     <strong>{{.Location.UpdatedAt.Format "2006-01-02"}}</strong>
   </article>
 </section>
-{{if .Import.Get "wages_assigned"}}<p class="notice">Updated wages for {{.Import.Get "wages_assigned"}} employee records.</p>{{end}}
-{{if .Import.Get "labor_exclusions"}}<p class="notice">Updated labor exclusion for {{.Import.Get "labor_exclusions"}} employees.</p>{{end}}
 <section>
   <div class="section-head">
     <h2>Employee details</h2>
@@ -3290,9 +3486,9 @@ const locationDetailsHTML = `{{define "body"}}
     </label>
   </div>
   <table>
-    <thead><tr><th>Name</th><th>Start date</th><th>Pay type</th><th>Wage</th><th>Birthday</th><th>Exclude labor</th></tr></thead>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th><th>Sign-in PIN</th></tr></thead>
     <tbody id="employee-detail-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td><td>{{if .SignInPIN}}{{.SignInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="6">No employees imported.</td></tr>{{end}}
     <tr id="employee-detail-empty" hidden><td colspan="6">No employees match this filter.</td></tr>
     </tbody>
   </table>
@@ -3302,6 +3498,56 @@ const locationDetailsHTML = `{{define "body"}}
   const rows = Array.from(document.querySelectorAll('#employee-detail-rows tr[data-name]'));
   const empty = document.getElementById('employee-detail-empty');
   const search = document.getElementById('employee-detail-search');
+  if (search) {
+    search.addEventListener('input', () => {
+      const value = search.value.trim().toLowerCase();
+      rows.forEach(row => row.hidden = value && !(row.dataset.name || '').toLowerCase().includes(value));
+      if (empty) empty.hidden = rows.some(row => !row.hidden);
+    });
+  }
+})();
+</script>
+{{end}}`
+
+const locationPayHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Employee Pay</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a class="active" href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+{{if .Import.Get "wages_assigned"}}<p class="notice">Updated wages for {{.Import.Get "wages_assigned"}} employee records.</p>{{end}}
+{{if .Import.Get "labor_exclusions"}}<p class="notice">Updated labor exclusion for {{.Import.Get "labor_exclusions"}} employees.</p>{{end}}
+<section>
+  <div class="section-head">
+    <h2>Employee pay</h2>
+    <label class="search-control">Name
+      <input id="employee-pay-search" type="search" placeholder="Filter by name">
+    </label>
+  </div>
+  <table>
+    <thead><tr><th>Name</th><th>Employee #</th><th>Pay type</th><th>Wage</th><th>Exclude labor</th></tr></thead>
+    <tbody id="employee-pay-rows">
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    <tr id="employee-pay-empty" hidden><td colspan="5">No employees match this filter.</td></tr>
+    </tbody>
+  </table>
+</section>
+<script>
+(() => {
+  const rows = Array.from(document.querySelectorAll('#employee-pay-rows tr[data-name]'));
+  const empty = document.getElementById('employee-pay-empty');
+  const search = document.getElementById('employee-pay-search');
   if (search) {
     search.addEventListener('input', () => {
       const value = search.value.trim().toLowerCase();
@@ -3376,6 +3622,7 @@ const locationDocumentsHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3384,6 +3631,7 @@ const locationDocumentsHTML = `{{define "body"}}
 </nav>
 {{if .Import.Get "added"}}<p class="notice">Employee bio imported for {{.Location.Name}}. Added {{.Import.Get "added"}}, updated {{.Import.Get "updated"}}, removed {{.Import.Get "removed"}}, skipped {{.Import.Get "skipped"}}.</p>{{end}}
 {{if .Import.Get "birthday_updated"}}<p class="notice">Birthday report imported for {{.Location.Name}}. Updated {{.Import.Get "birthday_updated"}} employee records. Skipped {{.Import.Get "birthday_skipped"}} rows that did not match current employees at this location.</p>{{end}}
+{{if .Import.Get "pin_updated"}}<p class="notice">PIN report imported for {{.Location.Name}}. Updated {{.Import.Get "pin_updated"}} employee records. Skipped {{.Import.Get "pin_skipped"}} rows that did not match current employees at this location.</p>{{end}}
 <section class="split">
   <form method="post" action="/locations/{{.Location.ID}}/upload" enctype="multipart/form-data" class="panel">
     <h2>Upload employee bio</h2>
@@ -3396,6 +3644,12 @@ const locationDocumentsHTML = `{{define "body"}}
     <p class="muted">This applies Employee Birthday Reader rows only to matching employees at this location.</p>
     <input type="file" name="birthdays" accept=".xlsx" required>
     <button>Upload birthdays</button>
+  </form>
+  <form method="post" action="/locations/{{.Location.ID}}/pins/upload" enctype="multipart/form-data" class="panel">
+    <h2>Upload PIN report</h2>
+    <p class="muted">This applies clock-in and sign-in PINs only to matching employees at this location.</p>
+    <input type="file" name="pins" accept=".pdf" required>
+    <button>Upload PINs</button>
   </form>
 </section>
 {{end}}`
@@ -3410,6 +3664,7 @@ const locationEditHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
   <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor Board</a>
@@ -3442,6 +3697,7 @@ const laborHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -3574,6 +3830,7 @@ const rolesHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -3616,6 +3873,7 @@ const departmentsHTML = `{{define "body"}}
 <nav class="portal-menu">
   <a href="/locations/{{.SelectedLocation.ID}}">Overview</a>
   <a href="/locations/{{.SelectedLocation.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor Board</a>
@@ -3673,7 +3931,7 @@ const docsHTML = `{{define "body"}}
     <thead><tr><th>Method</th><th>URL</th><th>Returns</th></tr></thead>
     <tbody>
       <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations</code></td><td>Locations with store numbers and employee counts.</td></tr>
-      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></td><td>Active employees for one store, including assigned role, department, and <code>birth_date</code> when known.</td></tr>
+      <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees</code></td><td>Active employees for one store, including assigned role, department, <code>birth_date</code>, and imported PINs when known.</td></tr>
       <tr><td>GET</td><td><code>{{.BaseURL}}/api/v1/locations/{storeNumber}/employees/{employeeNumber}</code></td><td>One active employee by employee number.</td></tr>
     </tbody>
   </table>
@@ -3685,6 +3943,10 @@ const docsHTML = `{{define "body"}}
 <section class="panel">
   <h2>Employee birthdays</h2>
   <p>Birthdays are imported from an Employee Birthday Reader .xlsx file with <code>Employee Name</code> and <code>Birth Date</code> columns. The API returns <code>birth_date</code> as <code>YYYY-MM-DD</code> when known and <code>null</code> when no birthday has been imported for that employee.</p>
+</section>
+<section class="panel">
+  <h2>Employee PINs</h2>
+  <p>PINs are imported from a location PIN report PDF with employee name, access level, clock-in PIN, and sign-in PIN columns. The importer matches current employees at that location by exact employee name.</p>
 </section>
 <section>
   <h2>LLM context and Go example</h2>

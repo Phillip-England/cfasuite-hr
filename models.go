@@ -62,6 +62,8 @@ type Employee struct {
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
 	BirthDate               *string   `json:"birth_date"`
+	ClockInPIN              *string   `json:"clock_in_pin"`
+	SignInPIN               *string   `json:"sign_in_pin"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
@@ -115,6 +117,12 @@ type BioEmployee struct {
 type BirthdayEmployee struct {
 	Name      string
 	BirthDate string
+}
+
+type PinEmployee struct {
+	Name       string
+	ClockInPIN string
+	SignInPIN  string
 }
 
 type TimePunchReport struct {

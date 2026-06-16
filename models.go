@@ -204,7 +204,9 @@ type LaborDay struct {
 
 type LaborTotals struct {
 	Minutes            int
+	RegularMinutes     int
 	OvertimeMinutes    int
+	RegularWagesCents  int64
 	WagesCents         int64
 	OvertimeWagesCents int64
 }

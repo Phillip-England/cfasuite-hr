@@ -3471,12 +3471,12 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 		expectLocation = false
 		if matches := employeeTotalsRe.FindStringSubmatch(line); matches != nil {
 			if current != nil {
-				current.Totals = LaborTotals{Minutes: parseDurationMinutes(matches[1]), WagesCents: lastMoneyCents(matches[2])}
+				current.Totals = parseLaborTotals(matches[1], matches[2])
 			}
 			continue
 		}
 		if matches := grandTotalsRe.FindStringSubmatch(line); matches != nil {
-			report.GrandTotals = LaborTotals{Minutes: parseDurationMinutes(matches[1]), WagesCents: lastMoneyCents(matches[2])}
+			report.GrandTotals = parseLaborTotals(matches[1], matches[2])
 			continue
 		}
 		if ignoreTimePunchLine(line) {
@@ -3523,8 +3523,12 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 		if report.Employees[i].Totals.Minutes == 0 && report.Employees[i].Totals.WagesCents == 0 {
 			report.Employees[i].Totals = dayTotals
 		} else {
-			report.Employees[i].Totals.OvertimeMinutes = dayTotals.OvertimeMinutes
-			report.Employees[i].Totals.OvertimeWagesCents = dayTotals.OvertimeWagesCents
+			if report.Employees[i].Totals.OvertimeMinutes == 0 {
+				report.Employees[i].Totals.OvertimeMinutes = dayTotals.OvertimeMinutes
+			}
+			if report.Employees[i].Totals.OvertimeWagesCents == 0 {
+				report.Employees[i].Totals.OvertimeWagesCents = dayTotals.OvertimeWagesCents
+			}
 		}
 	}
 	if report.GrandTotals.Minutes == 0 && report.GrandTotals.WagesCents == 0 {
@@ -3534,10 +3538,18 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 			report.GrandTotals.WagesCents += employee.Totals.WagesCents
 			report.GrandTotals.OvertimeWagesCents += employee.Totals.OvertimeWagesCents
 		}
-	} else {
+	} else if report.GrandTotals.OvertimeMinutes == 0 || report.GrandTotals.OvertimeWagesCents == 0 {
+		var overtimeMinutes int
+		var overtimeWagesCents int64
 		for _, employee := range report.Employees {
-			report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
-			report.GrandTotals.OvertimeWagesCents += employee.Totals.OvertimeWagesCents
+			overtimeMinutes += employee.Totals.OvertimeMinutes
+			overtimeWagesCents += employee.Totals.OvertimeWagesCents
+		}
+		if report.GrandTotals.OvertimeMinutes == 0 {
+			report.GrandTotals.OvertimeMinutes = overtimeMinutes
+		}
+		if report.GrandTotals.OvertimeWagesCents == 0 {
+			report.GrandTotals.OvertimeWagesCents = overtimeWagesCents
 		}
 	}
 	return report, nil
@@ -3809,7 +3821,13 @@ func salaryLaborDays(startDate, endDate string, monthlyCents int64) []LaborDay {
 
 func laborSummary(report TimePunchReport) []LaborSummary {
 	regularMinutes := report.GrandTotals.Minutes - report.GrandTotals.OvertimeMinutes
+	if report.GrandTotals.RegularMinutes > 0 {
+		regularMinutes = report.GrandTotals.RegularMinutes
+	}
 	regularWages := report.GrandTotals.WagesCents - report.GrandTotals.OvertimeWagesCents
+	if report.GrandTotals.RegularWagesCents > 0 {
+		regularWages = report.GrandTotals.RegularWagesCents
+	}
 	return []LaborSummary{
 		{Label: "Total week", Hours: formatHours(report.GrandTotals.Minutes), Dollars: "Regular " + formatHours(regularMinutes), Detail: "Overtime " + formatHours(report.GrandTotals.OvertimeMinutes)},
 		{Label: "Labor dollars", Hours: formatDollars(report.GrandTotals.WagesCents), Dollars: "Regular " + formatDollars(regularWages), Detail: "Overtime " + formatDollars(report.GrandTotals.OvertimeWagesCents)},
@@ -4026,6 +4044,38 @@ func parseDurationMinutes(value string) int {
 	hours, _ := strconv.Atoi(parts[0])
 	minutes, _ := strconv.Atoi(parts[1])
 	return hours*60 + minutes
+}
+
+func parseLaborTotals(totalDuration, text string) LaborTotals {
+	totals := LaborTotals{
+		Minutes:    parseDurationMinutes(totalDuration),
+		WagesCents: lastMoneyCents(text),
+	}
+	if matches := laborTotalsDetailRe.FindStringSubmatch(text); matches != nil {
+		totals.RegularMinutes = parseDurationMinutes(matches[1])
+		totals.RegularWagesCents = parseMoneyCents(matches[2])
+		totals.OvertimeMinutes = parseDurationMinutes(matches[3])
+		totals.OvertimeWagesCents = parseMoneyCents(matches[4])
+		totals.WagesCents = parseMoneyCents(matches[5])
+		if totals.RegularMinutes > 0 && totals.RegularMinutes+totals.OvertimeMinutes != totals.Minutes {
+			totals.OvertimeMinutes = totals.Minutes - totals.RegularMinutes
+		}
+		return totals
+	}
+	durations := durationRe.FindAllString(text, -1)
+	if len(durations) >= 2 {
+		totals.RegularMinutes = parseDurationMinutes(durations[0])
+		totals.OvertimeMinutes = parseDurationMinutes(durations[1])
+	}
+	matches := moneyRe.FindAllString(text, -1)
+	if len(matches) >= 3 {
+		totals.RegularWagesCents = parseMoneyCents(matches[0])
+		totals.OvertimeWagesCents = parseMoneyCents(matches[1])
+	}
+	if totals.RegularMinutes > 0 && totals.RegularMinutes+totals.OvertimeMinutes != totals.Minutes {
+		totals.OvertimeMinutes = totals.Minutes - totals.RegularMinutes
+	}
+	return totals
 }
 
 func lastMoneyCents(text string) int64 {
@@ -4629,6 +4679,8 @@ var (
 	punchLineRe                = regexp.MustCompile(`(?i)^\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*(\d{2}/\d{2}/\d{4})\s*\d{1,2}:\d{2}\s*[ap]\*?\s*(?:\d{1,2}:\d{2}\s*[ap]\*?|Open Punch)\s*(\d{1,4}:\d{2})\s*(Regular|Overtime|Unpaid|Break\s+\(Conv\s+To\s+Paid\))(.*)$`)
 	employeeTotalsRe           = regexp.MustCompile(`^Employee Totals\s*(\d{1,4}:\d{2})(.*)$`)
 	grandTotalsRe              = regexp.MustCompile(`^All Employees Grand Total\s*(\d{1,4}:\d{2})(.*)$`)
+	laborTotalsDetailRe        = regexp.MustCompile(`^\s*(\d{1,4}:\d{2})\s+(\$[\d,]+\.\d{2})\s+(\d{1,4}:\d{2})\s+(\$[\d,]+\.\d{2})\s+(\$[\d,]+\.\d{2})`)
+	durationRe                 = regexp.MustCompile(`\d{1,4}:\d{2}`)
 	periodRe                   = regexp.MustCompile(`^From\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})\s+through\s+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})$`)
 	moneyRe                    = regexp.MustCompile(`\$[\d,]+\.\d{2}`)
 	employeeNameRe             = regexp.MustCompile(`^[A-Za-z][A-Za-z ,.'()/-]+$`)

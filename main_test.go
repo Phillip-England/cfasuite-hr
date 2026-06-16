@@ -887,6 +887,39 @@ func TestParseTimePunchPDFSample(t *testing.T) {
 	}
 }
 
+func TestParseTimePunchPDFSouthroadsOvertimeTotals(t *testing.T) {
+	data, err := os.ReadFile("sr_tp.pdf")
+	if err != nil {
+		t.Skip("sr_tp.pdf fixture is not present")
+	}
+	report, err := parseTimePunchPDF(multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "sr_tp.pdf"})
+	if err != nil {
+		t.Fatalf("parseTimePunchPDF returned error: %v", err)
+	}
+	if report.GrandTotals.Minutes != 307177 {
+		t.Fatalf("expected total hours 5119:37, got %#v", report.GrandTotals)
+	}
+	if report.GrandTotals.OvertimeMinutes != 16168 {
+		t.Fatalf("expected overtime hours 269:28, got %#v", report.GrandTotals)
+	}
+	if report.GrandTotals.RegularMinutes != 291009 {
+		t.Fatalf("expected regular hours 4850:09, got %#v", report.GrandTotals)
+	}
+	if report.GrandTotals.WagesCents != 8227527 {
+		t.Fatalf("expected total wages $82,275.27, got %#v", report.GrandTotals)
+	}
+	if report.GrandTotals.RegularWagesCents != 7506345 {
+		t.Fatalf("expected regular wages $75,063.45, got %#v", report.GrandTotals)
+	}
+	if report.GrandTotals.OvertimeWagesCents != 721183 {
+		t.Fatalf("expected overtime wages $7,211.83, got %#v", report.GrandTotals)
+	}
+	summary := laborSummary(report)
+	if len(summary) < 2 || summary[0].Dollars != "Regular 4850.15" || summary[0].Detail != "Overtime 269.47" || summary[1].Dollars != "Regular $75063.45" || summary[1].Detail != "Overtime $7211.83" {
+		t.Fatalf("unexpected overtime summary: %#v", summary)
+	}
+}
+
 func TestLaborJobRowsUsesEmployeeJobs(t *testing.T) {
 	report, err := parseTimePunchText(`Employee Time Detail
 Store

@@ -1172,6 +1172,8 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"DateLabel":   "Saturday, June 13, 2026",
 				"MonthValue":  "2026-06",
 				"BackToMonth": "/locations/1/calendar?month=2026-06",
+				"PrevDayURL":  "/locations/1/calendar/2026-06-12",
+				"NextDayURL":  "/locations/1/calendar/2026-06-14",
 				"Sales": DailySales{
 					BusinessDate: "2026-06-13",
 					TotalCents:   1000,

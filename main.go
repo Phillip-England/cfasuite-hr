@@ -689,6 +689,8 @@ func (a *App) locationCalendarDay(w http.ResponseWriter, r *http.Request) {
 		"DateLabel":   date.Format("Monday, January 2, 2006"),
 		"MonthValue":  time.Date(date.Year(), date.Month(), 1, 0, 0, 0, 0, date.Location()).Format("2006-01"),
 		"BackToMonth": fmt.Sprintf("/locations/%d/calendar?month=%s", loc.ID, date.Format("2006-01")),
+		"PrevDayURL":  fmt.Sprintf("/locations/%d/calendar/%s", loc.ID, date.AddDate(0, 0, -1).Format("2006-01-02")),
+		"NextDayURL":  fmt.Sprintf("/locations/%d/calendar/%s", loc.ID, date.AddDate(0, 0, 1).Format("2006-01-02")),
 		"Sales":       sales,
 		"Import":      r.URL.Query(),
 	})
@@ -4599,7 +4601,11 @@ const locationCalendarDayHTML = `{{define "body"}}
     <h1>{{.Location.Name}} Calendar</h1>
     <p class="muted">Store {{.Location.Number}}</p>
   </div>
-  <a class="button secondary" href="{{.BackToMonth}}">Back to month</a>
+  <div class="actions">
+    <a class="button secondary" href="{{.PrevDayURL}}">Previous day</a>
+    <a class="button" href="{{.BackToMonth}}">Back to calendar</a>
+    <a class="button secondary" href="{{.NextDayURL}}">Next day</a>
+  </div>
 </div>
 <nav class="portal-menu">
   <a href="/locations/{{.Location.ID}}">Overview</a>
@@ -4614,8 +4620,13 @@ const locationCalendarDayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
 <section class="panel">
-  <h2>{{.DateLabel}}</h2>
-  <p class="muted">Sales data for this calendar day</p>
+  <div class="section-head compact">
+    <div>
+      <h2>{{.DateLabel}}</h2>
+      <p class="muted">Sales data for this calendar day</p>
+    </div>
+    <a class="button secondary" href="{{.BackToMonth}}">Back to calendar</a>
+  </div>
   {{if .Import.Get "sales_imported"}}<p class="notice">Daypart activity report imported.</p>{{end}}
   {{if .Sales.BusinessDate}}
     <p><strong>{{formatMoney .Sales.TotalCents}}</strong> total sales</p>
@@ -4634,7 +4645,10 @@ const locationCalendarDayHTML = `{{define "body"}}
   {{end}}
 </section>
 <section class="panel">
-  <h2>Upload sales data</h2>
+  <div class="section-head compact">
+    <h2>Upload sales data</h2>
+    <a class="button secondary" href="{{.BackToMonth}}">Back to calendar</a>
+  </div>
   <form method="post" action="/locations/{{.Location.ID}}/calendar/{{.Date}}/sales" enctype="multipart/form-data" class="labor-upload">
     <label>Daypart activity PDF
       <input type="file" name="daypart_activity" accept=".pdf" required>

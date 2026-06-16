@@ -73,10 +73,12 @@ type AssignmentStatus struct {
 }
 
 type CalendarDay struct {
-	Date         string
-	Day          int
-	CurrentMonth bool
-	Today        bool
+	Date          string
+	Day           int
+	CurrentMonth  bool
+	Today         bool
+	HasSales      bool
+	SalesRequired bool
 }
 
 type Role struct {
@@ -128,6 +130,37 @@ type BirthdayEmployee struct {
 type PinEmployee struct {
 	Name       string
 	ClockInPIN string
+}
+
+type DaypartSalesReport struct {
+	StoreName    string
+	BusinessDate string
+	Dayparts     map[string]int64
+	Destinations map[string]int64
+}
+
+type DailySales struct {
+	LocationID   int64
+	BusinessDate string
+	TotalCents   int64
+	Dayparts     map[string]int64
+	Destinations map[string]int64
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type SalesBreakdownRow struct {
+	Label   string
+	Cents   int64
+	Percent string
+}
+
+type SalesDailyRow struct {
+	Date         string
+	Weekday      string
+	TotalCents   int64
+	Dayparts     []SalesBreakdownRow
+	Destinations []SalesBreakdownRow
 }
 
 type TimePunchReport struct {

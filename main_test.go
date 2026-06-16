@@ -621,6 +621,90 @@ Kitchen Lead
 	}
 }
 
+func TestParseDaypartActivityPDFSingleDay(t *testing.T) {
+	data, err := os.ReadFile("daypart_activity_singleday.pdf")
+	if err != nil {
+		t.Skip("daypart_activity_singleday.pdf fixture is not present")
+	}
+	report, err := parseDaypartActivityPDF(multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "daypart_activity_singleday.pdf"})
+	if err != nil {
+		t.Fatalf("parseDaypartActivityPDF: %v", err)
+	}
+	if report.BusinessDate != "2026-06-08" {
+		t.Fatalf("unexpected business date: %s", report.BusinessDate)
+	}
+	if report.Dayparts["Breakfast"] != 448691 || report.Dayparts["Lunch"] != 1338179 || report.Dayparts["Afternoon"] != 544777 || report.Dayparts["Dinner"] != 954304 {
+		t.Fatalf("unexpected daypart totals: %#v", report.Dayparts)
+	}
+	if report.Destinations["DRIVE THRU"] != 1675920 || sumSalesMap(report.Destinations) != 3285951 {
+		t.Fatalf("unexpected destination totals: %#v", report.Destinations)
+	}
+}
+
+func TestParseDaypartActivityPDFRejectsMultiDay(t *testing.T) {
+	data, err := os.ReadFile("daypart_activity_multiday.pdf")
+	if err != nil {
+		t.Skip("daypart_activity_multiday.pdf fixture is not present")
+	}
+	if _, err := parseDaypartActivityPDF(multipartFile{Reader: bytes.NewReader(data)}, &multipart.FileHeader{Filename: "daypart_activity_multiday.pdf"}); err == nil {
+		t.Fatal("expected multi-day report to be rejected")
+	}
+}
+
+func TestSaveAndListDailySales(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	report := DaypartSalesReport{
+		BusinessDate: "2026-06-08",
+		Dayparts: map[string]int64{
+			"Breakfast": 100,
+			"Lunch":     200,
+			"Afternoon": 300,
+			"Dinner":    400,
+		},
+		Destinations: map[string]int64{
+			"CARRY OUT":    100,
+			"DELIVERY":     0,
+			"DINE IN":      100,
+			"DRIVE THRU":   800,
+			"M-CARRYOUT":   0,
+			"M-DINEIN":     0,
+			"M-DRIVE-THRU": 0,
+			"ON DEMAND":    0,
+			"PICKUP":       0,
+		},
+	}
+	if err := saveDailySales(db, locationID, report); err != nil {
+		t.Fatalf("saveDailySales: %v", err)
+	}
+	rows, err := listDailySales(db, locationID, "2026-06-08", "2026-06-08")
+	if err != nil {
+		t.Fatalf("listDailySales: %v", err)
+	}
+	if len(rows) != 1 || rows[0].TotalCents != 1000 || rows[0].Dayparts["Dinner"] != 400 || rows[0].Destinations["DRIVE THRU"] != 800 {
+		t.Fatalf("unexpected stored sales: %#v", rows)
+	}
+}
+
+func TestMissingSalesDatesSkipsSundays(t *testing.T) {
+	start := time.Date(2026, time.June, 7, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, time.June, 9, 0, 0, 0, 0, time.Local)
+	missing := missingSalesDates(start, end, []DailySales{{BusinessDate: "2026-06-08"}})
+	if len(missing) != 1 || missing[0] != "2026-06-09" {
+		t.Fatalf("unexpected missing dates: %#v", missing)
+	}
+}
+
 func TestMatchPinEmployeeIDHandlesExactReportName(t *testing.T) {
 	employees := []pinImportEmployee{{ID: 1, Name: "Vasquez, Rafael"}}
 	employees[0].Keys = pinNameKeys(employees[0].Name)
@@ -945,7 +1029,7 @@ Employee Totals 0:00 0:00 $0.00 $0.00
 func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	month := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local)
 	today := time.Date(2026, time.June, 13, 12, 0, 0, 0, time.Local)
-	days := calendarDays(month, today)
+	days := calendarDays(month, today, map[string]bool{"2026-06-13": true})
 	if len(days) != 42 {
 		t.Fatalf("expected 42 calendar cells, got %d", len(days))
 	}
@@ -963,6 +1047,12 @@ func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	}
 	if !foundToday {
 		t.Fatal("expected June 13 to be marked today")
+	}
+	if !days[13].HasSales {
+		t.Fatal("expected June 13 to show imported sales")
+	}
+	if days[0].SalesRequired {
+		t.Fatal("expected outside-month day to not require sales")
 	}
 }
 
@@ -1066,7 +1156,7 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"MonthValue": "2026-06",
 				"PrevMonth":  "2026-05",
 				"NextMonth":  "2026-07",
-				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local)),
+				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local), map[string]bool{"2026-06-13": true}),
 			},
 		},
 		{
@@ -1079,6 +1169,30 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"DateLabel":   "Saturday, June 13, 2026",
 				"MonthValue":  "2026-06",
 				"BackToMonth": "/locations/1/calendar?month=2026-06",
+				"Sales": DailySales{
+					BusinessDate: "2026-06-13",
+					TotalCents:   1000,
+					Dayparts:     map[string]int64{"Breakfast": 100, "Lunch": 200, "Afternoon": 300, "Dinner": 400},
+					Destinations: map[string]int64{"CARRY OUT": 100, "DELIVERY": 0, "DINE IN": 100, "DRIVE THRU": 800, "M-CARRYOUT": 0, "M-DINEIN": 0, "M-DRIVE-THRU": 0, "ON DEMAND": 0, "PICKUP": 0},
+				},
+				"Import": url.Values{},
+			},
+		},
+		{
+			name: "location sales",
+			body: locationSalesHTML,
+			data: map[string]any{
+				"Title":             "Sales",
+				"Location":          Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"StartDate":         "2026-06-08",
+				"EndDate":           "2026-06-08",
+				"MissingDates":      []string{},
+				"Complete":          true,
+				"DailyRows":         []SalesDailyRow{{Date: "2026-06-08", Weekday: "Monday", TotalCents: 1000, Dayparts: salesRowsForLabels(map[string]int64{"Breakfast": 100, "Lunch": 200, "Afternoon": 300, "Dinner": 400}, salesDayparts)}},
+				"DaypartRows":       salesRowsForLabels(map[string]int64{"Breakfast": 100, "Lunch": 200, "Afternoon": 300, "Dinner": 400}, salesDayparts),
+				"DestinationRows":   salesRowsForLabels(map[string]int64{"CARRY OUT": 100, "DELIVERY": 0, "DINE IN": 100, "DRIVE THRU": 800, "M-CARRYOUT": 0, "M-DINEIN": 0, "M-DRIVE-THRU": 0, "ON DEMAND": 0, "PICKUP": 0}, salesDestinations),
+				"DayOfWeekRows":     salesRowsForLabels(map[string]int64{"Monday": 1000}, []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}),
+				"SelectedDateCount": 1,
 			},
 		},
 		{

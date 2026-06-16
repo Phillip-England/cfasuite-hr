@@ -367,6 +367,7 @@ func migrate(db *sql.DB) error {
 			minutes INTEGER NOT NULL,
 			overtime_minutes INTEGER NOT NULL DEFAULT 0,
 			wages_cents INTEGER NOT NULL,
+			overtime_wages_cents INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY(location_id, business_date, group_type, label),
@@ -398,6 +399,9 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "clock_in_pin", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "daily_labor_breakdowns", "overtime_wages_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -2799,8 +2803,8 @@ func saveDailyLabor(db *sql.DB, locationID int64, date string, report TimePunchR
 		"employee":   daily.Employees,
 	} {
 		for label, total := range groups {
-			if _, err := tx.Exec(`INSERT INTO daily_labor_breakdowns (location_id, business_date, group_type, label, minutes, overtime_minutes, wages_cents)
-				VALUES (?, ?, ?, ?, ?, ?, ?)`, locationID, date, groupType, label, total.Minutes, total.OvertimeMinutes, total.WagesCents); err != nil {
+			if _, err := tx.Exec(`INSERT INTO daily_labor_breakdowns (location_id, business_date, group_type, label, minutes, overtime_minutes, wages_cents, overtime_wages_cents)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, locationID, date, groupType, label, total.Minutes, total.OvertimeMinutes, total.WagesCents, total.OvertimeWagesCents); err != nil {
 				return err
 			}
 		}
@@ -2822,7 +2826,7 @@ func dailyLaborFromReport(locationID int64, date string, report TimePunchReport)
 			if day.Date != date {
 				continue
 			}
-			total := LaborTotals{Minutes: day.Minutes, OvertimeMinutes: day.OvertimeMinutes, WagesCents: day.WagesCents}
+			total := LaborTotals{Minutes: day.Minutes, OvertimeMinutes: day.OvertimeMinutes, WagesCents: day.WagesCents, OvertimeWagesCents: day.OvertimeWagesCents}
 			daily.TotalMinutes += total.Minutes
 			daily.OvertimeMinutes += total.OvertimeMinutes
 			daily.TotalWagesCents += total.WagesCents
@@ -2882,7 +2886,7 @@ func listDailyLabor(db *sql.DB, locationID int64, startDate, endDate string) ([]
 }
 
 func loadLaborBreakdowns(db *sql.DB, labor *DailyLabor) error {
-	rows, err := db.Query(`SELECT group_type, label, minutes, overtime_minutes, wages_cents
+	rows, err := db.Query(`SELECT group_type, label, minutes, overtime_minutes, wages_cents, overtime_wages_cents
 		FROM daily_labor_breakdowns
 		WHERE location_id = ? AND business_date = ?
 		ORDER BY group_type, label`, labor.LocationID, labor.BusinessDate)
@@ -2893,7 +2897,7 @@ func loadLaborBreakdowns(db *sql.DB, labor *DailyLabor) error {
 	for rows.Next() {
 		var groupType, label string
 		var total LaborTotals
-		if err := rows.Scan(&groupType, &label, &total.Minutes, &total.OvertimeMinutes, &total.WagesCents); err != nil {
+		if err := rows.Scan(&groupType, &label, &total.Minutes, &total.OvertimeMinutes, &total.WagesCents, &total.OvertimeWagesCents); err != nil {
 			return err
 		}
 		switch groupType {
@@ -3082,11 +3086,12 @@ func aggregateStoredLaborRows(labor []DailyLabor, groupType string) []LaborEmplo
 	for _, label := range labels {
 		total := totals[label]
 		row := LaborEmployeeRow{
-			Hours:        formatHours(total.Minutes),
-			Dollars:      formatDollars(total.WagesCents),
-			Percent:      formatPercent(total.WagesCents, grand.WagesCents),
-			MinutesValue: total.Minutes,
-			CentsValue:   total.WagesCents,
+			Hours:           formatHours(total.Minutes),
+			Dollars:         formatDollars(total.WagesCents),
+			OvertimeDollars: formatDollars(total.OvertimeWagesCents),
+			Percent:         formatPercent(total.WagesCents, grand.WagesCents),
+			MinutesValue:    total.Minutes,
+			CentsValue:      total.WagesCents,
 		}
 		switch groupType {
 		case "role":
@@ -3115,6 +3120,9 @@ func sumStoredLabor(labor []DailyLabor) LaborTotals {
 		total.Minutes += day.TotalMinutes
 		total.OvertimeMinutes += day.OvertimeMinutes
 		total.WagesCents += day.TotalWagesCents
+		for _, group := range day.Jobs {
+			total.OvertimeWagesCents += group.OvertimeWagesCents
+		}
 	}
 	return total
 }
@@ -3124,6 +3132,7 @@ func addLaborTotals(values map[string]LaborTotals, label string, add LaborTotals
 	current.Minutes += add.Minutes
 	current.OvertimeMinutes += add.OvertimeMinutes
 	current.WagesCents += add.WagesCents
+	current.OvertimeWagesCents += add.OvertimeWagesCents
 	values[label] = current
 }
 
@@ -3486,19 +3495,23 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 		payType := strings.ToLower(matches[4])
 		minutes := 0
 		overtimeMinutes := 0
+		wagesCents := punchWagesCents(matches[5])
+		overtimeWagesCents := int64(0)
 		switch payType {
 		case "regular":
 			minutes = parseDurationMinutes(matches[3])
 		case "overtime":
 			overtimeMinutes = parseDurationMinutes(matches[3])
 			minutes = overtimeMinutes
+			overtimeWagesCents = wagesCents
 		}
 		day := LaborDay{
-			Weekday:         titleWeekday(matches[1]),
-			Date:            normalizeUSDate(matches[2]),
-			Minutes:         minutes,
-			OvertimeMinutes: overtimeMinutes,
-			WagesCents:      punchWagesCents(matches[5]),
+			Weekday:            titleWeekday(matches[1]),
+			Date:               normalizeUSDate(matches[2]),
+			Minutes:            minutes,
+			OvertimeMinutes:    overtimeMinutes,
+			WagesCents:         wagesCents,
+			OvertimeWagesCents: overtimeWagesCents,
 		}
 		addLaborDay(current, day)
 	}
@@ -3508,6 +3521,7 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 			report.Employees[i].Totals = dayTotals
 		} else {
 			report.Employees[i].Totals.OvertimeMinutes = dayTotals.OvertimeMinutes
+			report.Employees[i].Totals.OvertimeWagesCents = dayTotals.OvertimeWagesCents
 		}
 	}
 	if report.GrandTotals.Minutes == 0 && report.GrandTotals.WagesCents == 0 {
@@ -3515,10 +3529,12 @@ func parseTimePunchText(text string) (TimePunchReport, error) {
 			report.GrandTotals.Minutes += employee.Totals.Minutes
 			report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
 			report.GrandTotals.WagesCents += employee.Totals.WagesCents
+			report.GrandTotals.OvertimeWagesCents += employee.Totals.OvertimeWagesCents
 		}
 	} else {
 		for _, employee := range report.Employees {
 			report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
+			report.GrandTotals.OvertimeWagesCents += employee.Totals.OvertimeWagesCents
 		}
 	}
 	return report, nil
@@ -3576,6 +3592,7 @@ func addLaborDay(employee *LaborEmployee, day LaborDay) {
 			employee.Days[i].Minutes += day.Minutes
 			employee.Days[i].OvertimeMinutes += day.OvertimeMinutes
 			employee.Days[i].WagesCents += day.WagesCents
+			employee.Days[i].OvertimeWagesCents += day.OvertimeWagesCents
 			return
 		}
 	}
@@ -3589,6 +3606,7 @@ func sumEmployeeDays(employee LaborEmployee) LaborTotals {
 		totals.Minutes += day.Minutes
 		totals.OvertimeMinutes += day.OvertimeMinutes
 		totals.WagesCents += day.WagesCents
+		totals.OvertimeWagesCents += day.OvertimeWagesCents
 	}
 	return totals
 }
@@ -3753,6 +3771,7 @@ func recalculateReportTotals(report *TimePunchReport) {
 		report.GrandTotals.Minutes += employee.Totals.Minutes
 		report.GrandTotals.OvertimeMinutes += employee.Totals.OvertimeMinutes
 		report.GrandTotals.WagesCents += employee.Totals.WagesCents
+		report.GrandTotals.OvertimeWagesCents += employee.Totals.OvertimeWagesCents
 	}
 }
 
@@ -3845,14 +3864,15 @@ func laborEmployeeRows(report TimePunchReport) []LaborEmployeeRow {
 	rows := make([]LaborEmployeeRow, 0, len(employees))
 	for _, employee := range employees {
 		rows = append(rows, LaborEmployeeRow{
-			Name:         employee.Name,
-			Job:          employee.Job,
-			Role:         employee.Role,
-			Department:   employee.Department,
-			Hours:        formatHours(employee.Totals.Minutes),
-			Dollars:      formatDollars(employee.Totals.WagesCents),
-			MinutesValue: employee.Totals.Minutes,
-			CentsValue:   employee.Totals.WagesCents,
+			Name:            employee.Name,
+			Job:             employee.Job,
+			Role:            employee.Role,
+			Department:      employee.Department,
+			Hours:           formatHours(employee.Totals.Minutes),
+			Dollars:         formatDollars(employee.Totals.WagesCents),
+			OvertimeDollars: formatDollars(employee.Totals.OvertimeWagesCents),
+			MinutesValue:    employee.Totals.Minutes,
+			CentsValue:      employee.Totals.WagesCents,
 		})
 	}
 	return rows
@@ -3918,8 +3938,9 @@ func laborDepartmentRows(report TimePunchReport) []LaborEmployeeRow {
 
 func laborGroupRows(report TimePunchReport, group string) []LaborEmployeeRow {
 	type total struct {
-		minutes int
-		cents   int64
+		minutes       int
+		cents         int64
+		overtimeCents int64
 	}
 	byGroup := map[string]total{}
 	for _, employee := range report.Employees {
@@ -3927,6 +3948,7 @@ func laborGroupRows(report TimePunchReport, group string) []LaborEmployeeRow {
 		current := byGroup[key]
 		current.minutes += employee.Totals.Minutes
 		current.cents += employee.Totals.WagesCents
+		current.overtimeCents += employee.Totals.OvertimeWagesCents
 		byGroup[key] = current
 	}
 	type groupRow struct {
@@ -3937,11 +3959,12 @@ func laborGroupRows(report TimePunchReport, group string) []LaborEmployeeRow {
 	sortable := make([]groupRow, 0, len(byGroup))
 	for key, total := range byGroup {
 		row := LaborEmployeeRow{
-			Hours:        formatHours(total.minutes),
-			Dollars:      formatDollars(total.cents),
-			Percent:      formatPercent(total.cents, report.GrandTotals.WagesCents),
-			MinutesValue: total.minutes,
-			CentsValue:   total.cents,
+			Hours:           formatHours(total.minutes),
+			Dollars:         formatDollars(total.cents),
+			OvertimeDollars: formatDollars(total.overtimeCents),
+			Percent:         formatPercent(total.cents, report.GrandTotals.WagesCents),
+			MinutesValue:    total.minutes,
+			CentsValue:      total.cents,
 		}
 		switch group {
 		case "role":
@@ -5401,16 +5424,16 @@ const laborHTML = `{{define "body"}}
 <section class="split">
   <div>
     <h2>Labor by role</h2>
-    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody></table>
+    <table><thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborRoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No role labor found.</td></tr>{{end}}</tbody></table>
   </div>
   <div>
     <h2>Labor by department</h2>
-    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody></table>
+    <table><thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborDeptRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No department labor found.</td></tr>{{end}}</tbody></table>
   </div>
 </section>
 <section>
   <h2>Labor by job</h2>
-  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody></table>
+  <table><thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead><tbody>{{range .LaborJobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No job labor found.</td></tr>{{end}}</tbody></table>
 </section>
 <form method="post" action="/locations/{{.SelectedLocation.ID}}/labor" enctype="multipart/form-data" class="panel labor-upload">
   <label>Analyze a time punch report
@@ -5439,22 +5462,22 @@ const laborHTML = `{{define "body"}}
 <section>
   <h2>Labor by role</h2>
   <table>
-    <thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .RoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No role labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Role</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .RoleRows}}<tr><td>{{.Role}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No role labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by department</h2>
   <table>
-    <thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .DepartmentRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No department labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Department</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .DepartmentRows}}<tr><td>{{.Department}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No department labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section>
   <h2>Labor by job</h2>
   <table>
-    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Total labor</th></tr></thead>
-    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="4">No job labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th><th>Total labor</th></tr></thead>
+    <tbody>{{range .JobRows}}<tr><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td><td>{{.Percent}}</td></tr>{{else}}<tr><td colspan="5">No job labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <section id="employee-labor">
@@ -5483,8 +5506,8 @@ const laborHTML = `{{define "body"}}
     </div>
   </div>
   <table>
-    <thead><tr><th>Employee</th><th>Role</th><th>Department</th><th>Job</th><th>Hours</th><th>Labor dollars</th></tr></thead>
-    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Role}}</td><td>{{.Department}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td></tr>{{else}}<tr><td colspan="6">No employee labor found.</td></tr>{{end}}</tbody>
+    <thead><tr><th>Employee</th><th>Role</th><th>Department</th><th>Job</th><th>Hours</th><th>Labor dollars</th><th>Overtime wages</th></tr></thead>
+    <tbody id="employee-labor-rows">{{range .EmployeeRows}}<tr data-name="{{.Name}}" data-job="{{.Job}}" data-minutes="{{.MinutesValue}}" data-cents="{{.CentsValue}}"><td>{{.Name}}</td><td>{{.Role}}</td><td>{{.Department}}</td><td>{{.Job}}</td><td>{{.Hours}}</td><td>{{.Dollars}}</td><td>{{.OvertimeDollars}}</td></tr>{{else}}<tr><td colspan="7">No employee labor found.</td></tr>{{end}}</tbody>
   </table>
 </section>
 <script>

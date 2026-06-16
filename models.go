@@ -194,17 +194,19 @@ type LaborEmployee struct {
 }
 
 type LaborDay struct {
-	Weekday         string
-	Date            string
-	Minutes         int
-	OvertimeMinutes int
-	WagesCents      int64
+	Weekday            string
+	Date               string
+	Minutes            int
+	OvertimeMinutes    int
+	WagesCents         int64
+	OvertimeWagesCents int64
 }
 
 type LaborTotals struct {
-	Minutes         int
-	OvertimeMinutes int
-	WagesCents      int64
+	Minutes            int
+	OvertimeMinutes    int
+	WagesCents         int64
+	OvertimeWagesCents int64
 }
 
 type LaborSummary struct {
@@ -214,15 +216,16 @@ type LaborSummary struct {
 }
 
 type LaborEmployeeRow struct {
-	Name         string
-	Job          string
-	Role         string
-	Department   string
-	Hours        string
-	Dollars      string
-	Percent      string
-	MinutesValue int
-	CentsValue   int64
+	Name            string
+	Job             string
+	Role            string
+	Department      string
+	Hours           string
+	Dollars         string
+	OvertimeDollars string
+	Percent         string
+	MinutesValue    int
+	CentsValue      int64
 }
 
 type LaborDayRow struct {

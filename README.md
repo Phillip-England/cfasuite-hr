@@ -50,6 +50,10 @@ cfasuite-hr token delete -id 1
 cfasuite-hr api-context -base-url https://hr.example.com
 ```
 
+## Development
+
+See [docs/CODE_ORGANIZATION.md](docs/CODE_ORGANIZATION.md) for the module boundaries and refactor rules to follow as new features are added.
+
 `db path` prints the SQLite file path so you can inspect or copy it. The application itself does not require the `sqlite3` CLI, but if you have it installed you can run:
 
 ```sh

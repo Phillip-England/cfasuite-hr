@@ -309,6 +309,8 @@ func migrate(db *sql.DB) error {
 			wage_rate_cents INTEGER,
 			wage_pay_type TEXT NOT NULL DEFAULT '',
 			exclude_from_labor INTEGER NOT NULL DEFAULT 0,
+			profile_photo_data_url TEXT NOT NULL DEFAULT '',
+			profile_photo_needs_update INTEGER NOT NULL DEFAULT 0,
 			employee_status TEXT NOT NULL,
 			location_latest_start_date TEXT NOT NULL,
 			birth_date TEXT,
@@ -411,6 +413,12 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "exclude_from_labor", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "profile_photo_data_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "employees", "profile_photo_needs_update", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := ensureColumn(db, "employees", "clock_in_pin", "TEXT"); err != nil {
@@ -528,6 +536,9 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /locations/{id}", a.requireAdmin(a.locationShow))
 	mux.HandleFunc("GET /locations/{id}/details", a.requireAdmin(a.locationDetails))
 	mux.HandleFunc("GET /locations/{id}/pay", a.requireAdmin(a.locationPay))
+	mux.HandleFunc("GET /locations/{locationID}/employees/{id}", a.requireAdmin(a.employeeProfile))
+	mux.HandleFunc("POST /locations/{locationID}/employees/{id}/photo", a.requireAdmin(a.employeePhotoUpdate))
+	mux.HandleFunc("POST /locations/{locationID}/employees/{id}/photo/flag", a.requireAdmin(a.employeePhotoFlag))
 	mux.HandleFunc("GET /locations/{id}/calendar", a.requireAdmin(a.locationCalendar))
 	mux.HandleFunc("GET /locations/{id}/calendar/{date}", a.requireAdmin(a.locationCalendarDay))
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/sales", a.requireAdmin(a.locationSalesUpload))
@@ -716,6 +727,88 @@ func (a *App) locationPay(w http.ResponseWriter, r *http.Request) {
 		"Employees": employees,
 		"Import":    r.URL.Query(),
 	})
+}
+
+func (a *App) employeeProfile(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "locationID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employee, err := getEmployeeByID(a.db, locationID, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a.render(w, employee.EmployeeName, employeeProfileHTML, map[string]any{
+		"Location": loc,
+		"Employee": employee,
+		"Updated":  r.URL.Query().Get("updated"),
+		"Flagged":  r.URL.Query().Get("flagged"),
+	})
+}
+
+func (a *App) employeePhotoUpdate(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "locationID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getEmployeeByID(a.db, locationID, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	photo := strings.TrimSpace(r.FormValue("profile_photo_data_url"))
+	if err := validateProfilePhotoDataURL(photo); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := updateEmployeeProfilePhoto(a.db, locationID, id, photo); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/employees/%d?updated=1", locationID, id), http.StatusSeeOther)
+}
+
+func (a *App) employeePhotoFlag(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "locationID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getEmployeeByID(a.db, locationID, id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := flagEmployeeProfilePhoto(a.db, locationID, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/employees/%d?flagged=1", locationID, id), http.StatusSeeOther)
 }
 
 func (a *App) locationCalendar(w http.ResponseWriter, r *http.Request) {
@@ -1024,7 +1117,7 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1056,6 +1149,25 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	photo := strings.TrimSpace(r.FormValue("profile_photo_data_url"))
+	if employeeNeedsProfilePhoto(employee) {
+		data["EmployeeName"] = employee.EmployeeName
+		data["PhotoRequired"] = true
+		data["PhotoNeedsUpdate"] = employee.ProfilePhotoNeedsUpdate && employee.ProfilePhotoDataURL != ""
+		if photo == "" {
+			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+			return
+		}
+		if err := validateProfilePhotoDataURL(photo); err != nil {
+			data["Error"] = err.Error()
+			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+			return
+		}
+		if err := updateEmployeeProfilePhoto(a.db, loc.ID, employee.ID, photo); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	input.EmployeeID = employee.ID
 	if err := createTimePunchCorrection(a.db, input); err != nil {
@@ -2156,12 +2268,15 @@ func assignEmployeeWage(db *sql.DB, locationID int64, employeeIDs []int64, wageR
 	return updated, tx.Commit()
 }
 
-func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
-	rows, err := db.Query(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
+func employeeSelectSQL() string {
+	return `SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.profile_photo_data_url, e.profile_photo_needs_update, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
 		FROM employees e
 		LEFT JOIN roles r ON r.id = e.role_id
-		LEFT JOIN departments d ON d.id = e.department_id
-		WHERE e.location_id = ?
+		LEFT JOIN departments d ON d.id = e.department_id`
+}
+
+func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
+	rows, err := db.Query(employeeSelectSQL()+` WHERE e.location_id = ?
 		ORDER BY e.employee_name`, locationID)
 	if err != nil {
 		return nil, err
@@ -2179,20 +2294,17 @@ func listEmployees(db *sql.DB, locationID int64) ([]Employee, error) {
 }
 
 func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) {
-	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
-		FROM employees e
-		LEFT JOIN roles r ON r.id = e.role_id
-		LEFT JOIN departments d ON d.id = e.department_id
-		WHERE e.location_id = ? AND e.employee_number = ?`, locationID, number)
+	row := db.QueryRow(employeeSelectSQL()+` WHERE e.location_id = ? AND e.employee_number = ?`, locationID, number)
+	return scanEmployee(row)
+}
+
+func getEmployeeByID(db *sql.DB, locationID, id int64) (Employee, error) {
+	row := db.QueryRow(employeeSelectSQL()+` WHERE e.location_id = ? AND e.id = ?`, locationID, id)
 	return scanEmployee(row)
 }
 
 func getEmployeeByClockInPIN(db *sql.DB, locationID int64, pin string) (Employee, error) {
-	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
-		FROM employees e
-		LEFT JOIN roles r ON r.id = e.role_id
-		LEFT JOIN departments d ON d.id = e.department_id
-		WHERE e.location_id = ? AND e.clock_in_pin = ?`, locationID, pin)
+	row := db.QueryRow(employeeSelectSQL()+` WHERE e.location_id = ? AND e.clock_in_pin = ?`, locationID, pin)
 	return scanEmployee(row)
 }
 
@@ -2211,8 +2323,10 @@ func scanEmployee(row scanner) (Employee, error) {
 	var wageRateCents sql.NullInt64
 	var wagePayType sql.NullString
 	var excludeFromLabor int
+	var profilePhotoDataURL sql.NullString
+	var profilePhotoNeedsUpdate int
 	var clockInPIN sql.NullString
-	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &clockInPIN, &created, &updated)
+	err := row.Scan(&e.ID, &e.LocationID, &e.EmployeeName, &e.EmployeeNumber, &e.Job, &roleID, &roleName, &departmentID, &departmentName, &wageRateCents, &wagePayType, &excludeFromLabor, &profilePhotoDataURL, &profilePhotoNeedsUpdate, &e.EmployeeStatus, &e.LocationLatestStartDate, &birthDate, &clockInPIN, &created, &updated)
 	if roleID.Valid {
 		e.RoleID = &roleID.Int64
 	}
@@ -2232,6 +2346,10 @@ func scanEmployee(row scanner) (Employee, error) {
 		e.WagePayType = wagePayType.String
 	}
 	e.ExcludeFromLabor = excludeFromLabor != 0
+	if profilePhotoDataURL.Valid {
+		e.ProfilePhotoDataURL = profilePhotoDataURL.String
+	}
+	e.ProfilePhotoNeedsUpdate = profilePhotoNeedsUpdate != 0
 	if birthDate.Valid {
 		e.BirthDate = &birthDate.String
 	}
@@ -2241,6 +2359,20 @@ func scanEmployee(row scanner) (Employee, error) {
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
 	return e, err
+}
+
+func employeeNeedsProfilePhoto(employee Employee) bool {
+	return employee.ProfilePhotoDataURL == "" || employee.ProfilePhotoNeedsUpdate
+}
+
+func updateEmployeeProfilePhoto(db *sql.DB, locationID, id int64, dataURL string) error {
+	_, err := db.Exec(`UPDATE employees SET profile_photo_data_url = ?, profile_photo_needs_update = 0, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, dataURL, locationID, id)
+	return err
+}
+
+func flagEmployeeProfilePhoto(db *sql.DB, locationID, id int64) error {
+	_, err := db.Exec(`UPDATE employees SET profile_photo_needs_update = 1, updated_at = CURRENT_TIMESTAMP WHERE location_id = ? AND id = ?`, locationID, id)
+	return err
 }
 
 func createTimePunchCorrection(db *sql.DB, correction TimePunchCorrection) error {
@@ -2294,6 +2426,31 @@ func validateTimePunchCorrectionInput(correction TimePunchCorrection) error {
 	}
 	if !end.After(start) {
 		return errors.New("end time must be after start time")
+	}
+	return nil
+}
+
+func validateProfilePhotoDataURL(dataURL string) error {
+	if dataURL == "" {
+		return errors.New("profile photo is required")
+	}
+	parts := strings.SplitN(dataURL, ",", 2)
+	if len(parts) != 2 {
+		return errors.New("profile photo must be a cropped image")
+	}
+	header := parts[0]
+	if header != "data:image/jpeg;base64" && header != "data:image/png;base64" && header != "data:image/webp;base64" {
+		return errors.New("profile photo must be a JPEG, PNG, or WebP image")
+	}
+	raw, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return errors.New("profile photo could not be decoded")
+	}
+	if len(raw) == 0 {
+		return errors.New("profile photo is empty")
+	}
+	if len(raw) > maxUploadBytes {
+		return errors.New("profile photo is too large")
 	}
 	return nil
 }
@@ -5205,7 +5362,7 @@ const locationShowHTML = `{{define "body"}}
   <table>
     <thead><tr><th>Name</th><th>Employee #</th><th>Job</th><th>Role</th><th>Department</th></tr></thead>
     <tbody id="employee-rows">
-    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td>{{.EmployeeName}}</td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}{{$employee := .}}<tr data-job="{{.Job}}" data-role="{{if .RoleID}}{{.RoleID}}{{else}}__unassigned{{end}}" data-department="{{if .DepartmentID}}{{.DepartmentID}}{{else}}__unassigned{{end}}"><td><a class="employee-name-link" href="/locations/{{$.Location.ID}}/employees/{{.ID}}">{{if .ProfilePhotoDataURL}}<img class="avatar tiny" src="{{.ProfilePhotoDataURL}}" alt="">{{else}}<span class="avatar tiny placeholder">{{slice .EmployeeName 0 1}}</span>{{end}}<span>{{.EmployeeName}}</span>{{if .ProfilePhotoNeedsUpdate}}<span class="photo-flag">Update</span>{{end}}</a></td><td>{{.EmployeeNumber}}</td><td>{{.Job}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="role"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="role_id" aria-label="Role for {{.EmployeeName}}"><option value="" {{if not .RoleID}}selected{{end}}>Unassigned</option>{{range $.Roles}}<option value="{{.ID}}" {{if selectedID $employee.RoleID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form"><input type="hidden" name="assignment" value="department"><input type="hidden" name="employee_id" value="{{.ID}}"><select name="department_id" aria-label="Department for {{.EmployeeName}}"><option value="" {{if not .DepartmentID}}selected{{end}}>Unassigned</option>{{range $.Departments}}<option value="{{.ID}}" {{if selectedID $employee.DepartmentID .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></form></td></tr>{{else}}<tr><td colspan="5">No employees imported.</td></tr>{{end}}
     <tr id="employee-filter-empty" hidden><td colspan="5">No employees match these filters.</td></tr>
     </tbody>
   </table>
@@ -5332,7 +5489,7 @@ const locationDetailsHTML = `{{define "body"}}
   <table>
     <thead><tr><th>Name</th><th>Start date</th><th>Birthday</th><th>Clock-in PIN</th></tr></thead>
     <tbody id="employee-detail-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td><a class="employee-name-link" href="/locations/{{$.Location.ID}}/employees/{{.ID}}">{{if .ProfilePhotoDataURL}}<img class="avatar tiny" src="{{.ProfilePhotoDataURL}}" alt="">{{else}}<span class="avatar tiny placeholder">{{slice .EmployeeName 0 1}}</span>{{end}}<span>{{.EmployeeName}}</span>{{if .ProfilePhotoNeedsUpdate}}<span class="photo-flag">Update</span>{{end}}</a></td><td>{{.LocationLatestStartDate}}</td><td>{{if .BirthDate}}{{.BirthDate}}{{else}}<span class="muted">Unknown</span>{{end}}</td><td>{{if .ClockInPIN}}{{.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
     <tr id="employee-detail-empty" hidden><td colspan="4">No employees match this filter.</td></tr>
     </tbody>
   </table>
@@ -5386,7 +5543,7 @@ const locationPayHTML = `{{define "body"}}
   <table>
     <thead><tr><th>Name</th><th>Pay type</th><th>Wage</th><th>Exclude labor</th></tr></thead>
     <tbody id="employee-pay-rows">
-    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td>{{.EmployeeName}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
+    {{range .Employees}}<tr data-name="{{.EmployeeName}}"><td><a class="employee-name-link" href="/locations/{{$.Location.ID}}/employees/{{.ID}}">{{if .ProfilePhotoDataURL}}<img class="avatar tiny" src="{{.ProfilePhotoDataURL}}" alt="">{{else}}<span class="avatar tiny placeholder">{{slice .EmployeeName 0 1}}</span>{{end}}<span>{{.EmployeeName}}</span>{{if .ProfilePhotoNeedsUpdate}}<span class="photo-flag">Update</span>{{end}}</a></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_rate" value="{{formatWageInput .WageRateCents}}"><select name="wage_pay_type" aria-label="Pay type for {{.EmployeeName}}"><option value="" {{if eq .WagePayType ""}}selected{{end}}>Unknown</option><option value="hourly" {{if eq .WagePayType "hourly"}}selected{{end}}>Hourly</option><option value="salary" {{if eq .WagePayType "salary"}}selected{{end}}>Salary</option></select></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="wage-form"><input type="hidden" name="assignment" value="wage"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="wage_pay_type" value="{{.WagePayType}}"><input name="wage_rate" inputmode="decimal" value="{{formatWageInput .WageRateCents}}" placeholder="0.00" aria-label="Wage for {{.EmployeeName}}"></form></td><td><form method="post" action="/locations/{{$.Location.ID}}/assignments" class="assignment-form labor-exclusion-form"><input type="hidden" name="assignment" value="labor_exclusion"><input type="hidden" name="employee_id" value="{{.ID}}"><input type="hidden" name="exclude_from_labor" value="0"><input type="checkbox" name="exclude_from_labor" value="1" aria-label="Exclude {{.EmployeeName}} from labor calculations" {{if .ExcludeFromLabor}}checked{{end}}></form></td></tr>{{else}}<tr><td colspan="4">No employees imported.</td></tr>{{end}}
     <tr id="employee-pay-empty" hidden><td colspan="4">No employees match this filter.</td></tr>
     </tbody>
   </table>
@@ -5782,6 +5939,127 @@ const locationSecretLinksHTML = `{{define "body"}}
 </section>
 {{end}}`
 
+const photoCropperScript = `<script>
+(() => {
+  document.querySelectorAll('.photo-crop-form').forEach(form => {
+    const fileInput = form.querySelector('.photo-input');
+    const hiddenInput = form.querySelector('.photo-data-input');
+    const cropper = form.querySelector('.cropper');
+    const canvas = form.querySelector('.crop-canvas');
+    const zoomInput = form.querySelector('.zoom-input');
+    if (!fileInput || !hiddenInput || !cropper || !canvas || !zoomInput) return;
+    const ctx = canvas.getContext('2d');
+    const image = new Image();
+    let ready = false;
+
+    function draw() {
+      if (!ready) return;
+      const size = canvas.width;
+      const zoom = Number(zoomInput.value || 1);
+      const scale = Math.max(size / image.width, size / image.height) * zoom;
+      const width = image.width * scale;
+      const height = image.height * scale;
+      const x = (size - width) / 2;
+      const y = (size - height) / 2;
+      ctx.clearRect(0, 0, size, size);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(image, x, y, width, height);
+      ctx.restore();
+      hiddenInput.value = canvas.toDataURL('image/jpeg', 0.88);
+    }
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        image.onload = () => {
+          ready = true;
+          cropper.hidden = false;
+          zoomInput.value = '1';
+          draw();
+        };
+        image.src = String(reader.result || '');
+      };
+      reader.readAsDataURL(file);
+    });
+    zoomInput.addEventListener('input', draw);
+    form.addEventListener('submit', event => {
+      draw();
+      if (!hiddenInput.value) {
+        event.preventDefault();
+        alert('Choose a photo before submitting.');
+      }
+    });
+  });
+})();
+</script>`
+
+const employeeProfileHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Employee.EmployeeName}}</h1>
+    <p class="muted">Store {{.Location.Number}} | Employee # {{.Employee.EmployeeNumber}}</p>
+  </div>
+  <a class="button secondary" href="/locations/{{.Location.ID}}">Back to employees</a>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+{{if .Updated}}<p class="notice">Profile photo updated.</p>{{end}}
+{{if .Flagged}}<p class="notice">This employee will be asked for a new photo the next time they submit a time punch correction.</p>{{end}}
+<section class="profile-grid">
+  <div class="panel profile-photo-panel">
+    {{if .Employee.ProfilePhotoDataURL}}
+      <img class="avatar large" src="{{.Employee.ProfilePhotoDataURL}}" alt="Profile photo for {{.Employee.EmployeeName}}">
+    {{else}}
+      <div class="avatar large placeholder">{{slice .Employee.EmployeeName 0 1}}</div>
+    {{end}}
+    {{if .Employee.ProfilePhotoNeedsUpdate}}<p class="notice bad">Photo flagged for update.</p>{{end}}
+    <form method="post" action="/locations/{{.Location.ID}}/employees/{{.Employee.ID}}/photo/flag">
+      <button class="secondary" {{if not .Employee.ProfilePhotoDataURL}}disabled{{end}}>Flag photo for update</button>
+    </form>
+  </div>
+  <div class="panel">
+    <h2>Upload profile photo</h2>
+    <form method="post" action="/locations/{{.Location.ID}}/employees/{{.Employee.ID}}/photo" class="photo-crop-form" enctype="multipart/form-data">
+      <label>Photo
+        <input class="photo-input" type="file" accept="image/*" capture="user">
+      </label>
+      <div class="cropper" hidden>
+        <canvas class="crop-canvas" width="320" height="320"></canvas>
+        <label>Zoom <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
+      </div>
+      <input class="photo-data-input" type="hidden" name="profile_photo_data_url" required>
+      <button>Save photo</button>
+    </form>
+  </div>
+  <div class="panel">
+    <h2>Employee details</h2>
+    <p><strong>Job:</strong> {{.Employee.Job}}</p>
+    <p><strong>Role:</strong> {{if .Employee.RoleName}}{{.Employee.RoleName}}{{else}}<span class="muted">Unassigned</span>{{end}}</p>
+    <p><strong>Department:</strong> {{if .Employee.DepartmentName}}{{.Employee.DepartmentName}}{{else}}<span class="muted">Unassigned</span>{{end}}</p>
+    <p><strong>Start date:</strong> {{.Employee.LocationLatestStartDate}}</p>
+    <p><strong>Clock-in PIN:</strong> {{if .Employee.ClockInPIN}}{{.Employee.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</p>
+  </div>
+</section>
+` + photoCropperScript + `
+{{end}}`
+
 const locationTimePunchCorrectionsHTML = `{{define "body"}}
 <div class="row">
   <div>
@@ -5808,7 +6086,7 @@ const locationTimePunchCorrectionsHTML = `{{define "body"}}
   <table>
     <thead><tr><th>Submitted</th><th>Employee</th><th>Date</th><th>Worked</th><th>Notes</th><th></th></tr></thead>
     <tbody>
-    {{range .Corrections}}<tr><td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td><td>{{.EmployeeName}}<br><span class="muted">{{.EmployeeNumber}}</span></td><td>{{formatISODate .BusinessDate}}</td><td>{{.StartTime}}-{{.EndTime}}</td><td>{{if .Notes}}{{.Notes}}{{else}}<span class="muted">None</span>{{end}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/time-punch-corrections/{{.ID}}/delete" onsubmit="return confirm('Delete this completed correction?')"><button class="danger small">Delete</button></form></td></tr>{{else}}<tr><td colspan="6">No time punch corrections are waiting.</td></tr>{{end}}
+    {{range .Corrections}}<tr><td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td><td><a class="employee-name-link" href="/locations/{{$.Location.ID}}/employees/{{.EmployeeID}}"><span>{{.EmployeeName}}</span></a><br><span class="muted">{{.EmployeeNumber}}</span></td><td>{{formatISODate .BusinessDate}}</td><td>{{.StartTime}}-{{.EndTime}}</td><td>{{if .Notes}}{{.Notes}}{{else}}<span class="muted">None</span>{{end}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/time-punch-corrections/{{.ID}}/delete" onsubmit="return confirm('Delete this completed correction?')"><button class="danger small">Delete</button></form></td></tr>{{else}}<tr><td colspan="6">No time punch corrections are waiting.</td></tr>{{end}}
     </tbody>
   </table>
 </section>
@@ -5832,15 +6110,32 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       {{end}}
     </section>
   {{end}}
-  <form method="post" class="panel">
+  {{if .PhotoRequired}}
+    <section class="notice">
+      <strong>{{if .PhotoNeedsUpdate}}Please update your profile photo before submitting.{{else}}Please add a profile photo before submitting.{{end}}</strong>
+      <p>This photo helps the store confirm who submitted the correction.</p>
+    </section>
+  {{end}}
+  <form method="post" class="panel photo-crop-form" enctype="multipart/form-data">
     <label>Clock-in PIN <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" required></label>
     <label>Date <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
     <label>Shift started <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
     <label>Shift ended <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
     <label>Notes <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
+    {{if .PhotoRequired}}
+      <label>Profile photo
+        <input class="photo-input" type="file" accept="image/*" capture="user" required>
+      </label>
+      <div class="cropper" hidden>
+        <canvas class="crop-canvas" width="320" height="320"></canvas>
+        <label>Zoom <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
+      </div>
+      <input class="photo-data-input" type="hidden" name="profile_photo_data_url" required>
+    {{end}}
     <button>Submit correction</button>
   </form>
 </section>
+{{if .PhotoRequired}}` + photoCropperScript + `{{end}}
 {{end}}`
 
 const laborHTML = `{{define "body"}}
@@ -6135,6 +6430,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
-@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls,.upload-grid{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.upload-grid>div+div{margin-top:18px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.profile-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.profile-grid .panel:last-child{grid-column:1/-1}.profile-photo-panel{display:grid;gap:14px;justify-items:start}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-name-link{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-weight:700;text-decoration:none}.employee-name-link:hover{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.avatar{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;border:1px solid var(--line);border-radius:999px;background:#111;color:var(--muted);font-weight:800;text-transform:uppercase}.avatar.tiny{width:34px;height:34px;min-width:34px}.avatar.large{width:220px;height:220px;font-size:64px}.photo-flag{border:1px solid #5f4b12;background:#171202;color:#ffd66b;border-radius:6px;padding:2px 6px;font-size:12px}[hidden]{display:none!important}.cropper{display:grid;gap:12px;justify-items:start}.crop-canvas{width:min(320px,100%);height:auto;border:1px solid var(--line);border-radius:8px;background:#050505}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
+@media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.profile-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls,.upload-grid{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.profile-grid .panel,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.upload-grid>div+div{margin-top:18px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

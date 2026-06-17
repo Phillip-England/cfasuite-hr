@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"html/template"
 	"mime/multipart"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +73,98 @@ func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
 	}
 	if indexCount != 1 {
 		t.Fatalf("expected time punch token index to exist, got %d", indexCount)
+	}
+}
+
+func TestEmployeeProfilePhotoColumnsAndUpdate(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employeeID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	employee, err := getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID: %v", err)
+	}
+	if !employeeNeedsProfilePhoto(employee) {
+		t.Fatal("new employee should need a profile photo")
+	}
+	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
+	if err := updateEmployeeProfilePhoto(db, locationID, employeeID, photo); err != nil {
+		t.Fatalf("updateEmployeeProfilePhoto: %v", err)
+	}
+	employee, err = getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID after photo update: %v", err)
+	}
+	if employee.ProfilePhotoDataURL != photo || employee.ProfilePhotoNeedsUpdate || employeeNeedsProfilePhoto(employee) {
+		t.Fatalf("photo update did not persist clean state: %#v", employee)
+	}
+	if err := flagEmployeeProfilePhoto(db, locationID, employeeID); err != nil {
+		t.Fatalf("flagEmployeeProfilePhoto: %v", err)
+	}
+	employee, err = getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID after flag: %v", err)
+	}
+	if !employee.ProfilePhotoNeedsUpdate || !employeeNeedsProfilePhoto(employee) {
+		t.Fatalf("flag did not require a new photo: %#v", employee)
+	}
+}
+
+func TestEmployeeProfileRenders(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employeeID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	app, err := newApp(db)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/employee", nil)
+	req.SetPathValue("locationID", strconv.FormatInt(locationID, 10))
+	req.SetPathValue("id", strconv.FormatInt(employeeID, 10))
+	rec := httptest.NewRecorder()
+	app.employeeProfile(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("employeeProfile status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Upload profile photo") || !strings.Contains(body, "Blanco, John") {
+		t.Fatalf("employee profile did not render expected content: %s", body)
 	}
 }
 

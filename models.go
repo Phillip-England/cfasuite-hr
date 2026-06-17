@@ -61,6 +61,8 @@ type Employee struct {
 	WageRateCents           *int64    `json:"wage_rate_cents"`
 	WagePayType             string    `json:"wage_pay_type"`
 	ExcludeFromLabor        bool      `json:"exclude_from_labor"`
+	ProfilePhotoDataURL     string    `json:"profile_photo_data_url,omitempty"`
+	ProfilePhotoNeedsUpdate bool      `json:"profile_photo_needs_update"`
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
 	BirthDate               *string   `json:"birth_date"`

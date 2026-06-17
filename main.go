@@ -6255,49 +6255,142 @@ const locationTimePunchCorrectionsHTML = `{{define "body"}}
 {{end}}`
 
 const publicTimePunchCorrectionHTML = `{{define "body"}}
-<section class="narrow">
-  <h1>Time Punch Correction</h1>
-  <p class="muted">{{.Location.Name}} | Store {{.Location.Number}}</p>
-  {{if .Submitted}}<p class="notice">Your correction was submitted for {{.EmployeeName}}.</p>{{end}}
+<section class="narrow time-punch-page" data-time-punch-page>
+  <div class="public-page-head">
+    <div>
+      <h1 data-i18n="title">Time Punch Correction</h1>
+      <p class="muted">{{.Location.Name}} | <span data-i18n="store">Store</span> {{.Location.Number}}</p>
+    </div>
+    <nav class="language-toggle" aria-label="Language">
+      <button type="button" class="small secondary active" data-lang-button="en">English</button>
+      <button type="button" class="small secondary" data-lang-button="es">Espanol</button>
+    </nav>
+  </div>
+  {{if .Submitted}}<p class="notice"><span data-i18n="submitted">Your correction was submitted for</span> {{.EmployeeName}}.</p>{{end}}
   {{if .Error}}<p class="notice bad">{{.Error}}</p>{{end}}
   {{if .PinMissing}}
     <section class="notice bad">
-      <strong>We could not find that clock-in PIN for this store.</strong>
+      <strong data-i18n="pinMissingTitle">We could not find that clock-in PIN for this store.</strong>
       {{if .Location.Email}}
-      <p>Email your time punch correction to {{.Location.Email}}. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</p>
-      <p>No pudimos encontrar ese PIN de reloj para esta tienda. Envie su correccion de horas a {{.Location.Email}}. Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.</p>
+      <p><span data-i18n="pinMissingEmail">Email your time punch correction to</span> {{.Location.Email}}. <span data-i18n="pinMissingDetails">Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</span></p>
       {{else}}
-      <p>Email your time punch correction to the store. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</p>
-      <p>Envie su correccion de horas a la tienda. Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.</p>
+      <p data-i18n="pinMissingNoEmail">Email your time punch correction to the store. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</p>
       {{end}}
     </section>
   {{end}}
   {{if .PhotoRequired}}
-    <section class="notice">
-      <strong>{{if .PhotoNeedsUpdate}}Please update your profile photo before submitting.{{else}}Please add a profile photo before submitting.{{end}}</strong>
-      <p>This photo helps the store confirm who submitted the correction.</p>
+    <section class="photo-warning" role="alert" aria-live="assertive" data-photo-warning>
+      <div class="photo-warning-box">
+        <strong data-i18n="{{if .PhotoNeedsUpdate}}photoUpdateTitle{{else}}photoRequiredTitle{{end}}">{{if .PhotoNeedsUpdate}}Please update your profile photo before continuing.{{else}}We need a profile picture for you before continuing.{{end}}</strong>
+        <p data-i18n="photoRequiredBody">This photo helps the store confirm who submitted the correction.</p>
+        <button type="button" data-photo-prompt-button data-i18n="choosePhoto">Choose profile photo</button>
+      </div>
     </section>
   {{end}}
-  <form method="post" class="panel photo-crop-form" enctype="multipart/form-data">
-    <label>Clock-in PIN <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" required></label>
-    <label>Date <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
-    <label>Shift started <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
-    <label>Shift ended <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
-    <label>Notes <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
+  <form method="post" class="panel photo-crop-form time-punch-form" enctype="multipart/form-data">
+    <label><span data-i18n="clockPin">Clock-in PIN</span> <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" autocomplete="one-time-code" required></label>
+    <label><span data-i18n="date">Date</span> <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
+    <label><span data-i18n="shiftStart">Shift start</span> <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
+    <label><span data-i18n="shiftEnd">Shift end</span> <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
+    <label><span data-i18n="notes">Notes</span> <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
     {{if .PhotoRequired}}
-      <label>Profile photo
+      <label><span data-i18n="profilePhoto">Profile photo</span>
         <input class="photo-input" type="file" accept="image/*" capture="user" required>
       </label>
       <div class="cropper" hidden>
         <canvas class="crop-canvas" width="320" height="320"></canvas>
-        <label>Zoom <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
+        <label><span data-i18n="zoom">Zoom</span> <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
       </div>
       <input class="photo-data-input" type="hidden" name="profile_photo_data_url" required>
     {{end}}
-    <button>Submit correction</button>
+    <button data-i18n="submit">Submit correction</button>
   </form>
 </section>
 {{if .PhotoRequired}}` + photoCropperScript + `{{end}}
+<script>
+(() => {
+  const page = document.querySelector('[data-time-punch-page]');
+  if (!page) return;
+  const messages = {
+    en: {
+      title: 'Time Punch Correction',
+      store: 'Store',
+      submitted: 'Your correction was submitted for',
+      pinMissingTitle: 'We could not find that clock-in PIN for this store.',
+      pinMissingEmail: 'Email your time punch correction to',
+      pinMissingDetails: 'Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.',
+      pinMissingNoEmail: 'Email your time punch correction to the store. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.',
+      photoRequiredTitle: 'We need a profile picture for you before continuing.',
+      photoUpdateTitle: 'Please update your profile photo before continuing.',
+      photoRequiredBody: 'This photo helps the store confirm who submitted the correction.',
+      choosePhoto: 'Choose profile photo',
+      clockPin: 'Clock-in PIN',
+      date: 'Date',
+      shiftStart: 'Shift start',
+      shiftEnd: 'Shift end',
+      notes: 'Notes',
+      profilePhoto: 'Profile photo',
+      zoom: 'Zoom',
+      submit: 'Submit correction'
+    },
+    es: {
+      title: 'Correccion de Horas',
+      store: 'Tienda',
+      submitted: 'Su correccion fue enviada para',
+      pinMissingTitle: 'No pudimos encontrar ese PIN de reloj para esta tienda.',
+      pinMissingEmail: 'Envie su correccion de horas a',
+      pinMissingDetails: 'Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.',
+      pinMissingNoEmail: 'Envie su correccion de horas a la tienda. Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.',
+      photoRequiredTitle: 'Necesitamos una foto de perfil antes de continuar.',
+      photoUpdateTitle: 'Actualice su foto de perfil antes de continuar.',
+      photoRequiredBody: 'Esta foto ayuda a la tienda a confirmar quien envio la correccion.',
+      choosePhoto: 'Elegir foto de perfil',
+      clockPin: 'PIN de reloj',
+      date: 'Fecha',
+      shiftStart: 'Inicio del turno',
+      shiftEnd: 'Fin del turno',
+      notes: 'Notas',
+      profilePhoto: 'Foto de perfil',
+      zoom: 'Zoom',
+      submit: 'Enviar correccion'
+    }
+  };
+  function setLanguage(lang) {
+    const copy = messages[lang] || messages.en;
+    page.querySelectorAll('[data-i18n]').forEach(node => {
+      const key = node.dataset.i18n;
+      if (copy[key]) node.textContent = copy[key];
+    });
+    page.querySelectorAll('[data-lang-button]').forEach(button => {
+      button.classList.toggle('active', button.dataset.langButton === lang);
+    });
+    document.documentElement.lang = lang;
+    try { localStorage.setItem('timePunchLanguage', lang); } catch (_) {}
+  }
+  page.querySelectorAll('[data-lang-button]').forEach(button => {
+    button.addEventListener('click', () => setLanguage(button.dataset.langButton));
+  });
+  let preferred = 'en';
+  try { preferred = localStorage.getItem('timePunchLanguage') || preferred; } catch (_) {}
+  setLanguage(preferred === 'es' ? 'es' : 'en');
+
+  const photoWarning = page.querySelector('[data-photo-warning]');
+  const photoInput = page.querySelector('.photo-input');
+  const photoPromptButton = page.querySelector('[data-photo-prompt-button]');
+  if (photoWarning && photoInput && photoPromptButton) {
+    const openPicker = () => {
+      photoInput.scrollIntoView({block: 'center', behavior: 'smooth'});
+      photoInput.focus({preventScroll: true});
+      photoInput.click();
+    };
+    photoPromptButton.addEventListener('click', openPicker);
+    setTimeout(() => {
+      photoPromptButton.focus({preventScroll: true});
+      openPicker();
+    }, 350);
+  }
+})();
+</script>
 {{end}}`
 
 const laborHTML = `{{define "body"}}
@@ -6592,6 +6685,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.profile-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.profile-grid .panel:last-child{grid-column:1/-1}.profile-photo-panel{display:grid;gap:14px;justify-items:start}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-name-link{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-weight:700;text-decoration:none}.employee-name-link:hover{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.avatar{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;border:1px solid var(--line);border-radius:999px;background:#111;color:var(--muted);font-weight:800;text-transform:uppercase}.avatar.tiny{width:34px;height:34px;min-width:34px}.avatar.large{width:220px;height:220px;font-size:64px}.photo-flag{border:1px solid #5f4b12;background:#171202;color:#ffd66b;border-radius:6px;padding:2px 6px;font-size:12px}[hidden]{display:none!important}.cropper{display:grid;gap:12px;justify-items:start}.crop-canvas{width:min(320px,100%);height:auto;border:1px solid var(--line);border-radius:8px;background:#050505}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.profile-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.profile-grid .panel:last-child{grid-column:1/-1}.profile-photo-panel{display:grid;gap:14px;justify-items:start}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px;font-size:16px;line-height:1.3}input[type=date],input[type=time]{min-height:44px;text-align:left;-webkit-appearance:none;appearance:none}input[type=date]::-webkit-date-and-time-value,input[type=time]::-webkit-date-and-time-value{text-align:left}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-name-link{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-weight:700;text-decoration:none}.employee-name-link:hover{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.avatar{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;border:1px solid var(--line);border-radius:999px;background:#111;color:var(--muted);font-weight:800;text-transform:uppercase}.avatar.tiny{width:34px;height:34px;min-width:34px}.avatar.large{width:220px;height:220px;font-size:64px}.photo-flag{border:1px solid #5f4b12;background:#171202;color:#ffd66b;border-radius:6px;padding:2px 6px;font-size:12px}.public-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}.public-page-head h1{margin-bottom:8px}.language-toggle{display:flex;gap:6px;flex-wrap:nowrap}.language-toggle button{white-space:nowrap}.language-toggle button.active{background:var(--accent);color:white}.photo-warning{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.72)}.photo-warning-box{width:min(420px,100%);background:var(--panel);border:1px solid var(--bad);border-radius:8px;padding:20px;box-shadow:0 18px 60px rgba(0,0,0,.5)}.photo-warning-box strong{display:block;color:#ffd0d0;font-size:18px;line-height:1.25}.photo-warning-box p{color:var(--muted);margin:10px 0 18px}[hidden]{display:none!important}.cropper{display:grid;gap:12px;justify-items:start}.crop-canvas{width:min(320px,100%);height:auto;border:1px solid var(--line);border-radius:8px;background:#050505}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.profile-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls,.upload-grid{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.profile-grid .panel,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.upload-grid>div+div{margin-top:18px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

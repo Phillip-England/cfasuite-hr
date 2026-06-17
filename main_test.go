@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/base64"
+	"errors"
 	"html/template"
 	"mime/multipart"
 	"net/http/httptest"
@@ -1638,6 +1640,91 @@ func TestCalendarDaysBuildsStableMonthGrid(t *testing.T) {
 	}
 }
 
+func TestMonthlyProductivityGoalIsScopedByLocationAndMonth(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	firstLocationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation first: %v", err)
+	}
+	secondLocationID, err := createLocation(db, "West", "01234", "west@example.com")
+	if err != nil {
+		t.Fatalf("createLocation second: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, firstLocationID, "2026-06", 12550); err != nil {
+		t.Fatalf("saveMonthlyProductivityGoal first month: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, firstLocationID, "2026-05", 11000); err != nil {
+		t.Fatalf("saveMonthlyProductivityGoal previous month: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, secondLocationID, "2026-06", 9900); err != nil {
+		t.Fatalf("saveMonthlyProductivityGoal second location: %v", err)
+	}
+	goal, err := getMonthlyProductivityGoal(db, firstLocationID, "2026-06")
+	if err != nil {
+		t.Fatalf("getMonthlyProductivityGoal: %v", err)
+	}
+	if goal.GoalBasisPoints != 12550 || goal.GoalDisplayValue != "125.5" {
+		t.Fatalf("unexpected June goal: %#v", goal)
+	}
+	if err := saveMonthlyProductivityGoal(db, firstLocationID, "2026-06", 13000); err != nil {
+		t.Fatalf("update MonthlyProductivityGoal: %v", err)
+	}
+	goal, err = getMonthlyProductivityGoal(db, firstLocationID, "2026-06")
+	if err != nil {
+		t.Fatalf("get updated MonthlyProductivityGoal: %v", err)
+	}
+	if goal.GoalBasisPoints != 13000 || goal.GoalDisplayValue != "130" {
+		t.Fatalf("unexpected updated June goal: %#v", goal)
+	}
+	otherLocationGoal, err := getMonthlyProductivityGoal(db, secondLocationID, "2026-06")
+	if err != nil {
+		t.Fatalf("get second location MonthlyProductivityGoal: %v", err)
+	}
+	if otherLocationGoal.GoalBasisPoints != 9900 {
+		t.Fatalf("goal should be scoped by location: %#v", otherLocationGoal)
+	}
+	if err := deleteMonthlyProductivityGoal(db, firstLocationID, "2026-06"); err != nil {
+		t.Fatalf("deleteMonthlyProductivityGoal: %v", err)
+	}
+	if _, err := getMonthlyProductivityGoal(db, firstLocationID, "2026-06"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected deleted goal to be missing, got %v", err)
+	}
+}
+
+func TestParseProductivityGoal(t *testing.T) {
+	tests := []struct {
+		value string
+		want  int64
+	}{
+		{value: "125", want: 12500},
+		{value: "125.5", want: 12550},
+		{value: "125.50", want: 12550},
+		{value: "1,250.75", want: 125075},
+	}
+	for _, test := range tests {
+		got, err := parseProductivityGoal(test.value)
+		if err != nil {
+			t.Fatalf("parseProductivityGoal(%q): %v", test.value, err)
+		}
+		if got != test.want {
+			t.Fatalf("parseProductivityGoal(%q) = %d, want %d", test.value, got, test.want)
+		}
+	}
+	if _, err := parseProductivityGoal("10.123"); err == nil {
+		t.Fatal("expected too many decimals to fail")
+	}
+	if _, err := parseProductivityGoal("-1"); err == nil {
+		t.Fatal("expected negative value to fail")
+	}
+}
+
 func TestAdminTemplatesRender(t *testing.T) {
 	templates := []struct {
 		name string
@@ -1732,13 +1819,14 @@ func TestAdminTemplatesRender(t *testing.T) {
 			name: "location calendar",
 			body: locationCalendarHTML,
 			data: map[string]any{
-				"Title":      "Calendar",
-				"Location":   Location{ID: 1, Name: "Southroads", Number: "03394"},
-				"MonthLabel": "June 2026",
-				"MonthValue": "2026-06",
-				"PrevMonth":  "2026-05",
-				"NextMonth":  "2026-07",
-				"Days":       calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local), map[string]bool{"2026-06-13": true}, map[string]bool{}),
+				"Title":                 "Calendar",
+				"Location":              Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"MonthLabel":            "June 2026",
+				"MonthValue":            "2026-06",
+				"PrevMonth":             "2026-05",
+				"NextMonth":             "2026-07",
+				"ProductivityGoalValue": "125.5",
+				"Days":                  calendarDays(time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 13, 0, 0, 0, 0, time.Local), map[string]bool{"2026-06-13": true}, map[string]bool{}),
 			},
 		},
 		{

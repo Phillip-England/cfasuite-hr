@@ -18,15 +18,19 @@ The app uses port `8217` by default. Override it with `CFASUITE_ADDR` or `serve 
 ## Configuration
 
 ```sh
-export CFASUITE_DB_PATH=data/cfasuite-hr.db
 export CFASUITE_DATA_DIR=data
+export CFASUITE_DB_PATH=data/cfasuite-hr.db
 export CFASUITE_ADDR=:8217
 export CFASUITE_ADMIN_USERNAME=admin
 export CFASUITE_ADMIN_PASSWORD=change-me
 export CFASUITE_SESSION_SECRET=replace-with-a-long-random-value
 ```
 
-Profile photos are stored on disk under `CFASUITE_DATA_DIR` in per-location directories, for example `locations/03394/profile-pictures/employee-123.jpg`. If `CFASUITE_DATA_DIR` is not set, the app sets it at startup using the operating system's standard application data location.
+`CFASUITE_DATA_DIR` is the only application-owned filesystem tree. If it is not set, the app sets it at startup using the operating system's standard application data location. When `CFASUITE_DB_PATH` is not set, the SQLite database defaults to `CFASUITE_DATA_DIR/cfasuite-hr.db`.
+
+The app is designed around one SQLite database for the whole service. Do not add feature-specific database files. Store relational state in that database and add idempotent migrations as the schema grows.
+
+Profile photos are stored on disk under `CFASUITE_DATA_DIR` in per-location directories, for example `locations/03394/profile-pictures/employee-123.jpg`. Temporary files created for document parsing are stored under `CFASUITE_DATA_DIR/tmp`.
 
 Admin credentials can also be stored in SQLite:
 
@@ -99,6 +103,10 @@ The importer matches birthdays to current employees at the selected location by 
 Open a location in the admin UI, then upload the location PIN report `.pdf`. The report should include employee name, access level, clock-in PIN, and sign-in PIN columns.
 
 The importer ignores access level and sign-in PINs. It matches clock-in PINs to current employees at the selected location by normalized employee name, allowing the PIN report to omit middle names or initials. New employees from the employee bio import keep `clock_in_pin` as `null` until a matching PIN report is uploaded.
+
+## Monthly Productivity Goals
+
+Open a location calendar and choose the month you want to manage. Each location can store one productivity goal per calendar month, such as one goal for May and another for June. Clearing the value and saving removes that month's goal.
 
 ## API
 

@@ -8,7 +8,7 @@ import (
 const (
 	appName        = "cfasuite-hr"
 	defaultPort    = "8217"
-	defaultDBPath  = "data/cfasuite-hr.db"
+	defaultDBFile  = "cfasuite-hr.db"
 	sessionCookie  = "cfasuite_hr_session"
 	sessionTTL     = 12 * time.Hour
 	banWindow      = 24 * time.Hour
@@ -172,6 +172,15 @@ type DailySales struct {
 	Destinations map[string]int64
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+type MonthlyProductivityGoal struct {
+	LocationID       int64
+	Month            string
+	GoalBasisPoints  int64
+	GoalDisplayValue string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type SalesBreakdownRow struct {

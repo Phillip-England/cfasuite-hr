@@ -39,6 +39,24 @@ func TestParseBio(t *testing.T) {
 	}
 }
 
+func TestConfiguredDBPathKeepsLegacyDefault(t *testing.T) {
+	t.Setenv("CFASUITE_DB_PATH", "")
+	t.Setenv("CFASUITE_DATA_DIR", "")
+	if got := configuredDBPath(); got != defaultDBPath {
+		t.Fatalf("configuredDBPath() = %q, want %q", got, defaultDBPath)
+	}
+
+	t.Setenv("CFASUITE_DATA_DIR", "custom-data")
+	if got, want := configuredDBPath(), filepath.Join("custom-data", defaultDBFile); got != want {
+		t.Fatalf("configuredDBPath() with data dir = %q, want %q", got, want)
+	}
+
+	t.Setenv("CFASUITE_DB_PATH", "custom.db")
+	if got := configuredDBPath(); got != "custom.db" {
+		t.Fatalf("configuredDBPath() with db path = %q, want custom.db", got)
+	}
+}
+
 func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {

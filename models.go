@@ -9,6 +9,7 @@ const (
 	appName        = "cfasuite-hr"
 	defaultPort    = "8217"
 	defaultDBFile  = "cfasuite-hr.db"
+	defaultDBPath  = "data/cfasuite-hr.db"
 	sessionCookie  = "cfasuite_hr_session"
 	sessionTTL     = 12 * time.Hour
 	banWindow      = 24 * time.Hour

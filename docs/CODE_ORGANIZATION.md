@@ -16,7 +16,7 @@ The next refactors should continue splitting `main.go` into files while keeping 
 
 The application has one runtime system of record:
 
-- SQLite is the only database. Every feature stores relational state in the database opened from `CFASUITE_DB_PATH`, or from `CFASUITE_DATA_DIR/cfasuite-hr.db` when `CFASUITE_DB_PATH` is unset.
+- SQLite is the only database. Every feature stores relational state in the database opened from `CFASUITE_DB_PATH`, from `CFASUITE_DATA_DIR/cfasuite-hr.db` when `CFASUITE_DATA_DIR` is explicitly set, or from the legacy default `data/cfasuite-hr.db`.
 - Do not introduce per-feature database files, local JSON stores, hidden caches, or secondary persistence engines. If a feature needs state, add an idempotent migration and keep the storage helper in the owning module.
 - `*sql.DB` is created once at startup and passed through `App`. HTTP handlers, CLI commands, and import/sync functions should receive that database handle explicitly.
 - Filesystem writes are allowed only under `CFASUITE_DATA_DIR`, except the SQLite file itself when `CFASUITE_DB_PATH` deliberately points somewhere else.

@@ -26,7 +26,7 @@ export CFASUITE_ADMIN_PASSWORD=change-me
 export CFASUITE_SESSION_SECRET=replace-with-a-long-random-value
 ```
 
-`CFASUITE_DATA_DIR` is the only application-owned filesystem tree. If it is not set, the app sets it at startup using the operating system's standard application data location. When `CFASUITE_DB_PATH` is not set, the SQLite database defaults to `CFASUITE_DATA_DIR/cfasuite-hr.db`.
+`CFASUITE_DATA_DIR` is the application-owned filesystem tree for uploads, generated files, and temporary parser files. If it is not set, the app sets it at startup using the operating system's standard application data location. When `CFASUITE_DB_PATH` is not set, the SQLite database defaults to `data/cfasuite-hr.db` for backward compatibility; if `CFASUITE_DATA_DIR` is explicitly set, the database defaults to `CFASUITE_DATA_DIR/cfasuite-hr.db`.
 
 The app is designed around one SQLite database for the whole service. Do not add feature-specific database files. Store relational state in that database and add idempotent migrations as the schema grows.
 

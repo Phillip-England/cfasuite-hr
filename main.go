@@ -262,7 +262,10 @@ func configuredDBPath() string {
 	if path := strings.TrimSpace(os.Getenv("CFASUITE_DB_PATH")); path != "" {
 		return path
 	}
-	return filepath.Join(appDataDir(), defaultDBFile)
+	if dir := strings.TrimSpace(os.Getenv("CFASUITE_DATA_DIR")); dir != "" {
+		return filepath.Join(dir, defaultDBFile)
+	}
+	return defaultDBPath
 }
 
 func appDataDir() string {

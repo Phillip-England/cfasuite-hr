@@ -243,6 +243,21 @@ type SalesDailyRow struct {
 	Destinations []SalesBreakdownRow
 }
 
+type SalesChartPoint struct {
+	Date    string  `json:"date"`
+	Label   string  `json:"label"`
+	Actual  float64 `json:"actual"`
+	Average float64 `json:"average"`
+	Gap     float64 `json:"gap"`
+}
+
+type SalesBenchmark struct {
+	AverageCents  int64
+	IncludedDays  int
+	ExcludedDays  int
+	ExcludedDates []string
+}
+
 type TimePunchReport struct {
 	Title        string
 	LocationName string

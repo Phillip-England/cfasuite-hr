@@ -159,6 +159,40 @@ func TestProductivityRangeFromRequestRejectsMoreThan365Days(t *testing.T) {
 	}
 }
 
+func TestSalesBenchmarkExcludesZeroAndLowAnomalies(t *testing.T) {
+	sales := []DailySales{
+		{BusinessDate: "2026-06-01", TotalCents: 100000},
+		{BusinessDate: "2026-06-02", TotalCents: 120000},
+		{BusinessDate: "2026-06-03", TotalCents: 0},
+		{BusinessDate: "2026-06-04", TotalCents: 20000},
+		{BusinessDate: "2026-06-05", TotalCents: 110000},
+	}
+	benchmark := salesBenchmark(sales)
+	if benchmark.AverageCents != 110000 {
+		t.Fatalf("AverageCents = %d, want 110000", benchmark.AverageCents)
+	}
+	if benchmark.IncludedDays != 3 || benchmark.ExcludedDays != 2 {
+		t.Fatalf("unexpected benchmark counts: %#v", benchmark)
+	}
+	if len(benchmark.ExcludedDates) != 2 || benchmark.ExcludedDates[0] != "2026-06-03" || benchmark.ExcludedDates[1] != "2026-06-04" {
+		t.Fatalf("unexpected excluded dates: %#v", benchmark.ExcludedDates)
+	}
+}
+
+func TestSalesChartPointsUseBenchmarkAverage(t *testing.T) {
+	sales := []DailySales{
+		{BusinessDate: "2026-06-01", TotalCents: 100000},
+		{BusinessDate: "2026-06-02", TotalCents: 120000},
+	}
+	points := salesChartPoints(sales, 110000, time.Date(2026, time.June, 1, 0, 0, 0, 0, time.Local), time.Date(2026, time.June, 2, 0, 0, 0, 0, time.Local))
+	if len(points) != 2 {
+		t.Fatalf("expected 2 chart points, got %d", len(points))
+	}
+	if points[0].Actual != 1000 || points[0].Average != 1100 || points[0].Gap != -100 {
+		t.Fatalf("unexpected first point: %#v", points[0])
+	}
+}
+
 func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {
@@ -1981,6 +2015,8 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"MissingDates":      []string{},
 				"Complete":          true,
 				"DailyRows":         []SalesDailyRow{{Date: "2026-06-08", Weekday: "Monday", TotalCents: 1000, Dayparts: salesRowsForLabels(map[string]int64{"Breakfast": 100, "Lunch": 200, "Afternoon": 300, "Dinner": 400}, salesDayparts)}},
+				"SalesChart":        []SalesChartPoint{{Date: "2026-06-08", Label: "06/08", Actual: 10, Average: 10}},
+				"SalesBenchmark":    SalesBenchmark{AverageCents: 1000, IncludedDays: 1},
 				"DaypartRows":       salesRowsForLabels(map[string]int64{"Breakfast": 100, "Lunch": 200, "Afternoon": 300, "Dinner": 400}, salesDayparts),
 				"DestinationRows":   salesRowsForLabels(map[string]int64{"CARRY OUT": 100, "DELIVERY": 0, "DINE IN": 100, "DRIVE THRU": 800, "M-CARRYOUT": 0, "M-DINEIN": 0, "M-DRIVE-THRU": 0, "ON DEMAND": 0, "PICKUP": 0}, salesDestinations),
 				"DayOfWeekRows":     salesRowsForLabels(map[string]int64{"Monday": 1000}, []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}),

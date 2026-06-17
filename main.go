@@ -1218,6 +1218,7 @@ func (a *App) locationSales(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	missing := missingSalesDates(start, end, sales)
+	benchmark := salesBenchmark(sales)
 	a.render(w, loc.Name+" Sales", locationSalesHTML, map[string]any{
 		"Location":          loc,
 		"StartDate":         start.Format("2006-01-02"),
@@ -1225,6 +1226,8 @@ func (a *App) locationSales(w http.ResponseWriter, r *http.Request) {
 		"MissingDates":      missing,
 		"Complete":          len(missing) == 0,
 		"DailyRows":         salesDailyRows(sales),
+		"SalesChart":        salesChartPoints(sales, benchmark.AverageCents, start, end),
+		"SalesBenchmark":    benchmark,
 		"DaypartRows":       aggregateSalesRows(sales, "daypart"),
 		"DestinationRows":   aggregateSalesRows(sales, "destination"),
 		"DayOfWeekRows":     dayOfWeekSalesRows(sales),
@@ -3651,6 +3654,72 @@ func salesDailyRows(sales []DailySales) []SalesDailyRow {
 	return rows
 }
 
+func salesChartPoints(sales []DailySales, averageCents int64, start, end time.Time) []SalesChartPoint {
+	if len(sales) == 0 {
+		return nil
+	}
+	salesByDate := map[string]DailySales{}
+	for _, sale := range sales {
+		salesByDate[sale.BusinessDate] = sale
+	}
+	labelEvery := productivityChartLabelEvery(start, end)
+	points := []SalesChartPoint{}
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		date := d.Format("2006-01-02")
+		sale, ok := salesByDate[date]
+		if !ok {
+			continue
+		}
+		label := ""
+		if len(points)%labelEvery == 0 || d.Equal(start) || d.Equal(end) {
+			label = d.Format("01/02")
+		}
+		points = append(points, SalesChartPoint{
+			Date:    date,
+			Label:   label,
+			Actual:  centsFloat(sale.TotalCents),
+			Average: centsFloat(averageCents),
+			Gap:     centsFloat(sale.TotalCents - averageCents),
+		})
+	}
+	return points
+}
+
+func salesBenchmark(sales []DailySales) SalesBenchmark {
+	values := make([]int64, 0, len(sales))
+	for _, sale := range sales {
+		if sale.TotalCents > 0 {
+			values = append(values, sale.TotalCents)
+		}
+	}
+	if len(values) == 0 {
+		return SalesBenchmark{ExcludedDays: len(sales)}
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	median := values[len(values)/2]
+	if len(values)%2 == 0 {
+		median = (values[len(values)/2-1] + values[len(values)/2]) / 2
+	}
+	lowAnomalyLimit := median / 4
+	var total int64
+	var included int
+	benchmark := SalesBenchmark{}
+	for _, sale := range sales {
+		if sale.TotalCents <= 0 || sale.TotalCents < lowAnomalyLimit {
+			benchmark.ExcludedDays++
+			benchmark.ExcludedDates = append(benchmark.ExcludedDates, sale.BusinessDate)
+			continue
+		}
+		total += sale.TotalCents
+		included++
+	}
+	benchmark.IncludedDays = included
+	if included > 0 {
+		benchmark.AverageCents = int64(math.Round(float64(total) / float64(included)))
+	}
+	return benchmark
+}
+
 func aggregateSalesRows(sales []DailySales, groupType string) []SalesBreakdownRow {
 	var labels []string
 	totals := map[string]int64{}
@@ -3850,6 +3919,10 @@ func productivityBasisPoints(salesCents int64, laborMinutes int) int64 {
 }
 
 func basisPointsFloat(value int64) float64 {
+	return float64(value) / 100
+}
+
+func centsFloat(value int64) float64 {
 	return float64(value) / 100
 }
 
@@ -5310,7 +5383,7 @@ func formatPercent(part, total int64) string {
 	return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 }
 
-func formatChartJSON(points []ProductivityChartPoint) template.JS {
+func formatChartJSON(points any) template.JS {
 	data, err := json.Marshal(points)
 	if err != nil {
 		return "[]"
@@ -6557,8 +6630,22 @@ const locationSalesHTML = `{{define "body"}}
     <article class="metric"><span>Required days</span><strong>{{.SelectedDateCount}}</strong></article>
     <article class="metric"><span>Imported days</span><strong>{{len .DailyRows}}</strong></article>
     <article class="metric"><span>Total sales</span><strong>{{formatMoney (salesRowsTotal .DaypartRows)}}</strong></article>
+    <article class="metric"><span>Average sales</span><strong>{{formatMoney .SalesBenchmark.AverageCents}}</strong><em>{{.SalesBenchmark.IncludedDays}} benchmark days</em></article>
     <article class="metric"><span>Range</span><strong>{{formatISODate .StartDate}}</strong><em>{{formatISODate .EndDate}}</em></article>
   </section>
+  {{if .SalesChart}}
+    <section>
+      <div class="productivity-chart-wrap">
+        <canvas id="sales-chart" class="productivity-chart" width="1040" height="430" aria-label="Daily sales versus average sales chart"></canvas>
+      </div>
+    </section>
+  {{end}}
+  {{if .SalesBenchmark.ExcludedDates}}
+    <section class="notice">
+      <strong>Some dates were excluded from the average line.</strong>
+      <p>Zero or unusually low sales days: {{range .SalesBenchmark.ExcludedDates}}<a class="missing-date-link" href="{{calendarDayPath $.Location.ID .}}">{{formatISODate .}}</a> {{end}}</p>
+    </section>
+  {{end}}
   <section>
     <h2>Sales by day</h2>
     <table><thead><tr><th>Date</th><th>Day</th><th>Total</th><th>Breakfast</th><th>Lunch</th><th>Afternoon</th><th>Dinner</th></tr></thead><tbody>{{range .DailyRows}}<tr><td><a class="table-link" href="{{calendarDayPath $.Location.ID .Date}}">{{.DateLabel}}</a></td><td>{{.Weekday}}</td><td>{{formatMoney .TotalCents}}</td>{{range .Dayparts}}<td>{{formatMoney .Cents}}</td>{{end}}</tr>{{else}}<tr><td colspan="7">No sales found.</td></tr>{{end}}</tbody></table>
@@ -6583,6 +6670,98 @@ const locationSalesHTML = `{{define "body"}}
     <p>Missing required non-Sunday dates: {{range .MissingDates}}<a class="missing-date-link" href="{{calendarDayPath $.Location.ID .}}">{{formatISODate .}}</a> {{end}}</p>
   </section>
 {{end}}
+<script>
+(() => {
+  const canvas = document.getElementById('sales-chart');
+  if (!canvas) return;
+  const points = {{formatChartJSON .SalesChart}};
+  if (!points.length) return;
+  const parentWidth = canvas.parentElement ? canvas.parentElement.clientWidth : canvas.clientWidth;
+  canvas.style.width = Math.max(parentWidth, Math.min(3600, Math.max(720, points.length * 8))) + 'px';
+  const ctx = canvas.getContext('2d');
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || canvas.width;
+  const cssHeight = canvas.clientHeight || canvas.height;
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  ctx.scale(ratio, ratio);
+
+  const pad = {top: 26, right: 26, bottom: 72, left: 74};
+  const width = cssWidth - pad.left - pad.right;
+  const height = cssHeight - pad.top - pad.bottom;
+  const values = points.flatMap(point => [point.actual, point.average]);
+  let min = Math.floor((Math.min(...values) - 250) / 250) * 250;
+  let max = Math.ceil((Math.max(...values) + 250) / 250) * 250;
+  if (min < 0) min = 0;
+  if (min === max) max = min + 1000;
+  const x = index => pad.left + (points.length === 1 ? width / 2 : index * width / (points.length - 1));
+  const y = value => pad.top + (max - value) * height / (max - min);
+  const money = value => '$' + Math.round(value).toLocaleString();
+
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, cssWidth, cssHeight);
+  ctx.strokeStyle = '#303030';
+  ctx.fillStyle = '#a3a3a3';
+  ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let step = 0; step <= 5; step++) {
+    const value = min + (max - min) * step / 5;
+    const yy = y(value);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, yy);
+    ctx.lineTo(pad.left + width, yy);
+    ctx.stroke();
+    ctx.fillText(money(value), pad.left - 10, yy);
+  }
+
+  const drawLine = (key, color, dash = []) => {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const xx = x(index);
+      const yy = y(point[key]);
+      if (index === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+    });
+    ctx.stroke();
+    ctx.restore();
+  };
+  drawLine('average', '#3b82f6', [6, 5]);
+  drawLine('actual', '#f97316');
+
+  points.forEach((point, index) => {
+    const xx = x(index);
+    if (points.length <= 100 || point.label) {
+      ctx.fillStyle = '#f97316';
+      ctx.beginPath();
+      ctx.arc(xx, y(point.actual), 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(xx, pad.top + height + 14);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#a3a3a3';
+    ctx.fillText(point.label, 0, 4);
+    ctx.restore();
+  });
+
+  ctx.fillStyle = '#f5f5f5';
+  ctx.font = '700 14px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Daily sales', pad.left, 18);
+  ctx.fillStyle = '#f97316';
+  ctx.fillRect(pad.left + 78, 10, 18, 3);
+  ctx.fillStyle = '#f5f5f5';
+  ctx.fillText('Average', pad.left + 114, 18);
+  ctx.fillStyle = '#3b82f6';
+  ctx.fillRect(pad.left + 176, 10, 18, 3);
+})();
+</script>
 {{end}}`
 
 const locationProductivityHTML = `{{define "body"}}

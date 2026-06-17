@@ -6131,6 +6131,8 @@ const photoCropperScript = `<script>
       ctx.drawImage(image, x, y, width, height);
       ctx.restore();
       hiddenInput.value = canvas.toDataURL('image/jpeg', 0.88);
+      hiddenInput.dispatchEvent(new Event('input', {bubbles: true}));
+      hiddenInput.dispatchEvent(new Event('change', {bubbles: true}));
     }
 
     fileInput.addEventListener('change', () => {
@@ -6378,12 +6380,22 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
   const photoInput = page.querySelector('.photo-input');
   const photoPromptButton = page.querySelector('[data-photo-prompt-button]');
   if (photoWarning && photoInput && photoPromptButton) {
+    const photoDataInput = page.querySelector('.photo-data-input');
+    const updatePhotoWarning = () => {
+      if (photoDataInput && photoDataInput.value) {
+        photoWarning.hidden = true;
+      }
+    };
     const openPicker = () => {
       photoInput.scrollIntoView({block: 'center', behavior: 'smooth'});
       photoInput.focus({preventScroll: true});
       photoInput.click();
     };
     photoPromptButton.addEventListener('click', openPicker);
+    if (photoDataInput) {
+      photoDataInput.addEventListener('input', updatePhotoWarning);
+      photoDataInput.addEventListener('change', updatePhotoWarning);
+    }
     setTimeout(() => {
       photoPromptButton.focus({preventScroll: true});
       openPicker();

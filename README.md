@@ -19,11 +19,14 @@ The app uses port `8217` by default. Override it with `CFASUITE_ADDR` or `serve 
 
 ```sh
 export CFASUITE_DB_PATH=data/cfasuite-hr.db
+export CFASUITE_DATA_DIR=data
 export CFASUITE_ADDR=:8217
 export CFASUITE_ADMIN_USERNAME=admin
 export CFASUITE_ADMIN_PASSWORD=change-me
 export CFASUITE_SESSION_SECRET=replace-with-a-long-random-value
 ```
+
+Profile photos are stored on disk under `CFASUITE_DATA_DIR` in per-location directories, for example `locations/03394/profile-pictures/employee-123.jpg`. If `CFASUITE_DATA_DIR` is not set, the app sets it at startup using the operating system's standard application data location.
 
 Admin credentials can also be stored in SQLite:
 

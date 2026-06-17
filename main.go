@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +82,7 @@ Usage:
 
 Environment:
   CFASUITE_DB_PATH
+  CFASUITE_DATA_DIR
   CFASUITE_ADDR
   CFASUITE_ADMIN_USERNAME
   CFASUITE_ADMIN_PASSWORD
@@ -101,6 +103,7 @@ func cmdServe(args []string) {
 	must(err)
 	log.Printf("%s listening on %s", appName, *addr)
 	log.Printf("database: %s", abs(*dbPath))
+	log.Printf("data directory: %s", abs(app.dataDir))
 	must(http.ListenAndServe(*addr, app.routes()))
 }
 
@@ -253,6 +256,39 @@ func mustDB(path string) *sql.DB {
 	must(err)
 	must(migrate(db))
 	return db
+}
+
+func appDataDir() string {
+	if dir := strings.TrimSpace(os.Getenv("CFASUITE_DATA_DIR")); dir != "" {
+		return dir
+	}
+	dir := defaultAppDataDir()
+	_ = os.Setenv("CFASUITE_DATA_DIR", dir)
+	return dir
+}
+
+func defaultAppDataDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, "Library", "Application Support", appName)
+		}
+	case "windows":
+		if local := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); local != "" {
+			return filepath.Join(local, appName)
+		}
+		if roaming := strings.TrimSpace(os.Getenv("APPDATA")); roaming != "" {
+			return filepath.Join(roaming, appName)
+		}
+	default:
+		if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
+			return filepath.Join(xdg, appName)
+		}
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, ".local", "share", appName)
+		}
+	}
+	return "data"
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -522,7 +558,8 @@ func newApp(db *sql.DB) (*App, error) {
 			return nil, err
 		}
 	}
-	return &App{db: db, sessionSecret: []byte(secret), adminUsername: username, adminPassword: password, adminHash: adminHash}, nil
+	dataDir := appDataDir()
+	return &App{db: db, dataDir: dataDir, sessionSecret: []byte(secret), adminUsername: username, adminPassword: password, adminHash: adminHash}, nil
 }
 
 func (a *App) routes() http.Handler {
@@ -539,6 +576,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /locations/{locationID}/employees/{id}", a.requireAdmin(a.employeeProfile))
 	mux.HandleFunc("POST /locations/{locationID}/employees/{id}/photo", a.requireAdmin(a.employeePhotoUpdate))
 	mux.HandleFunc("POST /locations/{locationID}/employees/{id}/photo/flag", a.requireAdmin(a.employeePhotoFlag))
+	mux.HandleFunc("GET /locations/{locationID}/employees/{id}/photo/image", a.requireAdmin(a.employeePhotoImage))
 	mux.HandleFunc("GET /locations/{id}/calendar", a.requireAdmin(a.locationCalendar))
 	mux.HandleFunc("GET /locations/{id}/calendar/{date}", a.requireAdmin(a.locationCalendarDay))
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/sales", a.requireAdmin(a.locationSalesUpload))
@@ -769,7 +807,13 @@ func (a *App) employeePhotoUpdate(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err := getEmployeeByID(a.db, locationID, id); err != nil {
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employee, err := getEmployeeByID(a.db, locationID, id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -782,11 +826,45 @@ func (a *App) employeePhotoUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := updateEmployeeProfilePhoto(a.db, locationID, id, photo); err != nil {
+	photoURL, err := saveEmployeeProfilePhoto(a.dataDir, loc, employee, photo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := updateEmployeeProfilePhoto(a.db, locationID, id, photoURL); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d/employees/%d?updated=1", locationID, id), http.StatusSeeOther)
+}
+
+func (a *App) employeePhotoImage(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "locationID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	employee, err := getEmployeeByID(a.db, locationID, id)
+	if err != nil || employee.ProfilePhotoDataURL == "" {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := employeeProfilePhotoPath(a.dataDir, loc, employee)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, path)
 }
 
 func (a *App) employeePhotoFlag(w http.ResponseWriter, r *http.Request) {
@@ -1164,7 +1242,12 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
 			return
 		}
-		if err := updateEmployeeProfilePhoto(a.db, loc.ID, employee.ID, photo); err != nil {
+		photoURL, err := saveEmployeeProfilePhoto(a.dataDir, loc, employee, photo)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := updateEmployeeProfilePhoto(a.db, loc.ID, employee.ID, photoURL); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -2431,28 +2514,107 @@ func validateTimePunchCorrectionInput(correction TimePunchCorrection) error {
 }
 
 func validateProfilePhotoDataURL(dataURL string) error {
+	_, _, err := parseProfilePhotoDataURL(dataURL)
+	return err
+}
+
+func parseProfilePhotoDataURL(dataURL string) ([]byte, string, error) {
 	if dataURL == "" {
-		return errors.New("profile photo is required")
+		return nil, "", errors.New("profile photo is required")
 	}
 	parts := strings.SplitN(dataURL, ",", 2)
 	if len(parts) != 2 {
-		return errors.New("profile photo must be a cropped image")
+		return nil, "", errors.New("profile photo must be a cropped image")
 	}
-	header := parts[0]
-	if header != "data:image/jpeg;base64" && header != "data:image/png;base64" && header != "data:image/webp;base64" {
-		return errors.New("profile photo must be a JPEG, PNG, or WebP image")
+	ext := ""
+	switch parts[0] {
+	case "data:image/jpeg;base64":
+		ext = "jpg"
+	case "data:image/png;base64":
+		ext = "png"
+	case "data:image/webp;base64":
+		ext = "webp"
+	default:
+		return nil, "", errors.New("profile photo must be a JPEG, PNG, or WebP image")
 	}
 	raw, err := base64.StdEncoding.DecodeString(parts[1])
 	if err != nil {
-		return errors.New("profile photo could not be decoded")
+		return nil, "", errors.New("profile photo could not be decoded")
 	}
 	if len(raw) == 0 {
-		return errors.New("profile photo is empty")
+		return nil, "", errors.New("profile photo is empty")
 	}
 	if len(raw) > maxUploadBytes {
-		return errors.New("profile photo is too large")
+		return nil, "", errors.New("profile photo is too large")
 	}
-	return nil
+	return raw, ext, nil
+}
+
+func saveEmployeeProfilePhoto(dataDir string, loc Location, employee Employee, dataURL string) (string, error) {
+	raw, ext, err := parseProfilePhotoDataURL(dataURL)
+	if err != nil {
+		return "", err
+	}
+	dir := employeeProfilePhotoDir(dataDir, loc)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for _, oldExt := range []string{"jpg", "png", "webp"} {
+		if oldExt == ext {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, employeeProfilePhotoFilename(employee, oldExt))); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	path := filepath.Join(dir, employeeProfilePhotoFilename(employee, ext))
+	temp := path + ".tmp"
+	if err := os.WriteFile(temp, raw, 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temp, path); err != nil {
+		_ = os.Remove(temp)
+		return "", err
+	}
+	return fmt.Sprintf("/locations/%d/employees/%d/photo/image?v=%d", loc.ID, employee.ID, time.Now().UnixNano()), nil
+}
+
+func employeeProfilePhotoPath(dataDir string, loc Location, employee Employee) (string, error) {
+	dir := employeeProfilePhotoDir(dataDir, loc)
+	for _, ext := range []string{"jpg", "png", "webp"} {
+		path := filepath.Join(dir, employeeProfilePhotoFilename(employee, ext))
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+func employeeProfilePhotoDir(dataDir string, loc Location) string {
+	return filepath.Join(dataDir, "locations", safePathName(loc.Number), "profile-pictures")
+}
+
+func employeeProfilePhotoFilename(employee Employee, ext string) string {
+	return fmt.Sprintf("employee-%d.%s", employee.ID, ext)
+}
+
+func safePathName(name string) string {
+	name = strings.TrimSpace(name)
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 func employeeWageForNumber(tx *sql.Tx, employeeNumber string) (any, string, error) {

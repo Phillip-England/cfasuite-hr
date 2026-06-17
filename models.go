@@ -31,6 +31,7 @@ var requiredBirthdayColumns = []string{
 
 type App struct {
 	db            *sql.DB
+	dataDir       string
 	sessionSecret []byte
 	adminUsername string
 	adminPassword string

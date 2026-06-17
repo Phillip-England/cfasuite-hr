@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,6 +126,67 @@ func TestEmployeeProfilePhotoColumnsAndUpdate(t *testing.T) {
 	}
 	if !employee.ProfilePhotoNeedsUpdate || !employeeNeedsProfilePhoto(employee) {
 		t.Fatalf("flag did not require a new photo: %#v", employee)
+	}
+}
+
+func TestSaveEmployeeProfilePhotoWritesToLocationDirectory(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employeeID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	loc, err := getLocation(db, locationID)
+	if err != nil {
+		t.Fatalf("getLocation: %v", err)
+	}
+	employee, err := getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID: %v", err)
+	}
+	dataDir := t.TempDir()
+	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
+	photoURL, err := saveEmployeeProfilePhoto(dataDir, loc, employee, photo)
+	if err != nil {
+		t.Fatalf("saveEmployeeProfilePhoto: %v", err)
+	}
+	if !strings.HasPrefix(photoURL, "/locations/"+strconv.FormatInt(locationID, 10)+"/employees/"+strconv.FormatInt(employeeID, 10)+"/photo/image?v=") {
+		t.Fatalf("unexpected photo URL: %s", photoURL)
+	}
+	path := filepath.Join(dataDir, "locations", "03394", "profile-pictures", "employee-"+strconv.FormatInt(employeeID, 10)+".jpg")
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved photo: %v", err)
+	}
+	if string(written) != "photo" {
+		t.Fatalf("saved photo contents = %q", string(written))
+	}
+	if err := updateEmployeeProfilePhoto(db, locationID, employeeID, photoURL); err != nil {
+		t.Fatalf("updateEmployeeProfilePhoto: %v", err)
+	}
+	app := &App{db: db, dataDir: dataDir}
+	req := httptest.NewRequest("GET", photoURL, nil)
+	req.SetPathValue("locationID", strconv.FormatInt(locationID, 10))
+	req.SetPathValue("id", strconv.FormatInt(employeeID, 10))
+	rec := httptest.NewRecorder()
+	app.employeePhotoImage(rec, req)
+	if rec.Code != 200 || rec.Body.String() != "photo" {
+		t.Fatalf("employeePhotoImage status = %d body = %q", rec.Code, rec.Body.String())
 	}
 }
 

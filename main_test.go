@@ -100,6 +100,65 @@ func TestProductivityReportCombinesSalesLaborAndGoal(t *testing.T) {
 	}
 }
 
+func TestProductivityReportRangeUsesMonthlyGoalsAndMissingDates(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, locationID, "2026-01", 8000); err != nil {
+		t.Fatalf("save January goal: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, locationID, "2026-02", 9000); err != nil {
+		t.Fatalf("save February goal: %v", err)
+	}
+	for _, date := range []string{"2026-01-31", "2026-02-02"} {
+		if _, err := db.Exec(`INSERT INTO daily_sales (location_id, business_date, total_cents) VALUES (?, ?, ?)`, locationID, date, int64(800000)); err != nil {
+			t.Fatalf("insert sales %s: %v", date, err)
+		}
+		if _, err := db.Exec(`INSERT INTO daily_labor (location_id, business_date, total_minutes, overtime_minutes, total_wages_cents) VALUES (?, ?, 6000, 0, 0)`, locationID, date); err != nil {
+			t.Fatalf("insert labor %s: %v", date, err)
+		}
+	}
+	dateRange := ProductivityDateRange{
+		Start:   time.Date(2026, time.January, 31, 0, 0, 0, 0, time.Local),
+		End:     time.Date(2026, time.February, 3, 0, 0, 0, 0, time.Local),
+		IsRange: true,
+	}
+	today := time.Date(2026, time.February, 4, 0, 0, 0, 0, time.Local)
+	report, err := productivityReportForRange(db, locationID, dateRange, today)
+	if err != nil {
+		t.Fatalf("productivityReportForRange: %v", err)
+	}
+	if got, want := report.RangeLabel, "Saturday, January 31, 2026 to Tuesday, February 3, 2026"; got != want {
+		t.Fatalf("RangeLabel = %q, want %q", got, want)
+	}
+	if len(report.Rows) != 2 {
+		t.Fatalf("expected 2 completed rows, got %d", len(report.Rows))
+	}
+	if report.Rows[0].TargetDisplay != "80" || report.Rows[1].TargetDisplay != "90" {
+		t.Fatalf("unexpected range targets: %#v", report.Rows)
+	}
+	if len(report.MissingDates) != 1 || report.MissingDates[0] != "2026-02-03" {
+		t.Fatalf("unexpected missing dates: %#v", report.MissingDates)
+	}
+}
+
+func TestProductivityRangeFromRequestRejectsMoreThan365Days(t *testing.T) {
+	req := httptest.NewRequest("GET", "/locations/1/productivity?start_date=2025-01-01&end_date=2026-01-01", nil)
+	today := time.Date(2026, time.January, 2, 0, 0, 0, 0, time.Local)
+	if _, err := productivityRangeFromRequest(req, today); err == nil {
+		t.Fatal("expected range longer than 365 days to fail")
+	}
+}
+
 func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {

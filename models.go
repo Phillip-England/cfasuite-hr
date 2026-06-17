@@ -190,6 +190,10 @@ type ProductivityReport struct {
 	MonthLabel         string
 	PrevMonth          string
 	NextMonth          string
+	StartDate          string
+	EndDate            string
+	RangeLabel         string
+	IsRange            bool
 	GoalBasisPoints    int64
 	GoalDisplayValue   string
 	Rows               []ProductivityRow
@@ -198,6 +202,7 @@ type ProductivityReport struct {
 	TotalLaborMinutes  int
 	AverageBasisPoints int64
 	MissingDates       []string
+	MissingGoalMonths  []string
 }
 
 type ProductivityRow struct {

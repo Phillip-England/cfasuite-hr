@@ -46,7 +46,7 @@ func TestImportBioSyncsEmployees(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestEmployeeRolesAreAssignedSeparatelyFromJobs(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestEmployeeDepartmentsAreAssignedSeparatelyFromJobs(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -168,11 +168,11 @@ func TestRoleAndDepartmentNamesCanRepeatAcrossLocations(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	firstLocationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("create first location: %v", err)
 	}
-	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	secondLocationID, err := createLocation(db, "Downtown", "01234", "downtown@example.com")
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
@@ -213,11 +213,11 @@ func TestEmployeeWagesAreAssignedByEmployeeNumber(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	firstLocationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("create first location: %v", err)
 	}
-	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	secondLocationID, err := createLocation(db, "Downtown", "01234", "downtown@example.com")
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestEmployeeLaborExclusionPersistsForLocation(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -294,11 +294,11 @@ func TestEmployeeAssignmentsStayWithinLocation(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	firstLocationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("create first location: %v", err)
 	}
-	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	secondLocationID, err := createLocation(db, "Downtown", "01234", "downtown@example.com")
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
@@ -360,11 +360,11 @@ func TestImportBioDoesNotInheritRoleOrDepartmentAcrossLocations(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	firstLocationID, err := createLocation(db, "Southroads", "03394")
+	firstLocationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("create first location: %v", err)
 	}
-	secondLocationID, err := createLocation(db, "Downtown", "01234")
+	secondLocationID, err := createLocation(db, "Downtown", "01234", "downtown@example.com")
 	if err != nil {
 		t.Fatalf("create second location: %v", err)
 	}
@@ -414,7 +414,7 @@ func TestImportBioPreservesRolesForRemainingEmployees(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -473,11 +473,11 @@ func TestImportBirthdaysUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
-	otherLocationID, err := createLocation(db, "Northroads", "01234")
+	otherLocationID, err := createLocation(db, "Northroads", "01234", "northroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -560,11 +560,11 @@ func TestImportPinsUpdatesMatchingEmployeesForLocation(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
-	otherLocationID, err := createLocation(db, "Northroads", "01234")
+	otherLocationID, err := createLocation(db, "Northroads", "01234", "northroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -622,6 +622,83 @@ Kitchen Lead
 	}
 }
 
+func TestTimePunchCorrectionUsesClockInPINForLocation(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin)
+		VALUES (?, 'Blanco, John', '12-1083836', 'Team Member', 'Active', '2026-01-01', '99129')`, locationID)
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employee, err := getEmployeeByClockInPIN(db, locationID, "99129")
+	if err != nil {
+		t.Fatalf("getEmployeeByClockInPIN: %v", err)
+	}
+	if err := createTimePunchCorrection(db, TimePunchCorrection{
+		LocationID:   locationID,
+		EmployeeID:   employee.ID,
+		ClockInPIN:   "99129",
+		BusinessDate: "2026-06-13",
+		StartTime:    "08:00",
+		EndTime:      "15:30",
+		Notes:        "Forgot to clock in",
+	}); err != nil {
+		t.Fatalf("createTimePunchCorrection: %v", err)
+	}
+	corrections, err := listTimePunchCorrections(db, locationID)
+	if err != nil {
+		t.Fatalf("listTimePunchCorrections: %v", err)
+	}
+	if len(corrections) != 1 || corrections[0].EmployeeName != "Blanco, John" || corrections[0].StartTime != "08:00" {
+		t.Fatalf("unexpected corrections: %#v", corrections)
+	}
+	if err := deleteTimePunchCorrection(db, locationID, corrections[0].ID); err != nil {
+		t.Fatalf("deleteTimePunchCorrection: %v", err)
+	}
+	corrections, err = listTimePunchCorrections(db, locationID)
+	if err != nil {
+		t.Fatalf("listTimePunchCorrections after delete: %v", err)
+	}
+	if len(corrections) != 0 {
+		t.Fatalf("expected correction to be deleted, got %#v", corrections)
+	}
+}
+
+func TestUnknownClockInPINDoesNotCreateCorrection(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	if _, err := getEmployeeByClockInPIN(db, locationID, "00000"); err == nil {
+		t.Fatal("expected missing PIN to return an error")
+	}
+	corrections, err := listTimePunchCorrections(db, locationID)
+	if err != nil {
+		t.Fatalf("listTimePunchCorrections: %v", err)
+	}
+	if len(corrections) != 0 {
+		t.Fatalf("missing PIN should not create corrections: %#v", corrections)
+	}
+}
+
 func TestParseDaypartActivityPDFSingleDay(t *testing.T) {
 	data, err := os.ReadFile("daypart_activity_singleday.pdf")
 	if err != nil {
@@ -661,7 +738,7 @@ func TestSaveAndListDailySales(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -823,7 +900,7 @@ func TestSaveDailyLaborPersistsSelectedDate(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -1105,7 +1182,7 @@ func TestLaborUploadWageUpdateAndExclusion(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	locationID, err := createLocation(db, "Southroads", "03394")
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
 	if err != nil {
 		t.Fatalf("createLocation: %v", err)
 	}
@@ -1337,8 +1414,46 @@ func TestAdminTemplatesRender(t *testing.T) {
 			body: locationEditHTML,
 			data: map[string]any{
 				"Title":    "Edit",
-				"Location": Location{ID: 1, Name: "Southroads", Number: "03394"},
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
 				"Saved":    "1",
+			},
+		},
+		{
+			name: "location secret links",
+			body: locationSecretLinksHTML,
+			data: map[string]any{
+				"Title":         "Secret Links",
+				"Location":      Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
+				"TimePunchLink": "https://hr.example.com/forms/time-punch/secret",
+			},
+		},
+		{
+			name: "location time punch corrections",
+			body: locationTimePunchCorrectionsHTML,
+			data: map[string]any{
+				"Title":    "Time Punch Corrections",
+				"Location": Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
+				"Corrections": []TimePunchCorrection{{
+					ID:             1,
+					EmployeeName:   "Blanco, John",
+					EmployeeNumber: "12-1083836",
+					BusinessDate:   "2026-06-13",
+					StartTime:      "08:00",
+					EndTime:        "15:30",
+					Notes:          "Forgot to clock in",
+					CreatedAt:      time.Date(2026, time.June, 13, 16, 0, 0, 0, time.Local),
+				}},
+			},
+		},
+		{
+			name: "public time punch correction",
+			body: publicTimePunchCorrectionHTML,
+			data: map[string]any{
+				"Title":     "Time Punch Correction",
+				"LoggedOut": true,
+				"Location":  Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
+				"Today":     "2026-06-13",
+				"Form":      TimePunchCorrection{},
 			},
 		},
 		{

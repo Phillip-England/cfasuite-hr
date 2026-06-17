@@ -38,12 +38,14 @@ type App struct {
 }
 
 type Location struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Number    string    `json:"number"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Employees int       `json:"employee_count,omitempty"`
+	ID             int64     `json:"id"`
+	Name           string    `json:"name"`
+	Number         string    `json:"number"`
+	Email          string    `json:"email,omitempty"`
+	TimePunchToken string    `json:"-"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Employees      int       `json:"employee_count,omitempty"`
 }
 
 type Employee struct {
@@ -136,6 +138,20 @@ type BirthdayEmployee struct {
 type PinEmployee struct {
 	Name       string
 	ClockInPIN string
+}
+
+type TimePunchCorrection struct {
+	ID             int64
+	LocationID     int64
+	EmployeeID     int64
+	EmployeeName   string
+	EmployeeNumber string
+	ClockInPIN     string
+	BusinessDate   string
+	StartTime      string
+	EndTime        string
+	Notes          string
+	CreatedAt      time.Time
 }
 
 type DaypartSalesReport struct {

@@ -19,6 +19,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -276,9 +277,12 @@ func migrate(db *sql.DB) error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
 			number TEXT NOT NULL UNIQUE,
+			email TEXT NOT NULL DEFAULT '',
+			time_punch_token TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_time_punch_token ON locations(time_punch_token) WHERE time_punch_token <> ''`,
 		`CREATE TABLE IF NOT EXISTS roles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
@@ -374,6 +378,18 @@ func migrate(db *sql.DB) error {
 			FOREIGN KEY(location_id, business_date) REFERENCES daily_labor(location_id, business_date) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_daily_labor_location_date ON daily_labor(location_id, business_date)`,
+		`CREATE TABLE IF NOT EXISTS time_punch_corrections (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+			employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+			clock_in_pin TEXT NOT NULL,
+			business_date TEXT NOT NULL,
+			start_time TEXT NOT NULL,
+			end_time TEXT NOT NULL,
+			notes TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_time_punch_corrections_location ON time_punch_corrections(location_id, created_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
@@ -401,8 +417,42 @@ func migrate(db *sql.DB) error {
 	if err := ensureColumn(db, "employees", "clock_in_pin", "TEXT"); err != nil {
 		return err
 	}
+	if err := ensureColumn(db, "locations", "email", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "locations", "time_punch_token", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureLocationTimePunchTokens(db); err != nil {
+		return err
+	}
 	if err := ensureColumn(db, "daily_labor_breakdowns", "overtime_wages_cents", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	return nil
+}
+
+func ensureLocationTimePunchTokens(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id FROM locations WHERE time_punch_token = '' OR time_punch_token IS NULL`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE locations SET time_punch_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, randomToken(32), id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -482,6 +532,9 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/labor", a.requireAdmin(a.locationLaborUpload))
 	mux.HandleFunc("GET /locations/{id}/sales", a.requireAdmin(a.locationSales))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
+	mux.HandleFunc("GET /locations/{id}/secret-links", a.requireAdmin(a.locationSecretLinks))
+	mux.HandleFunc("GET /locations/{id}/time-punch-corrections", a.requireAdmin(a.locationTimePunchCorrections))
+	mux.HandleFunc("POST /locations/{locationID}/time-punch-corrections/{id}/delete", a.requireAdmin(a.locationTimePunchCorrectionDelete))
 	mux.HandleFunc("GET /locations/{id}/edit", a.requireAdmin(a.locationEdit))
 	mux.HandleFunc("POST /locations/{id}", a.requireAdmin(a.locationUpdate))
 	mux.HandleFunc("POST /locations/{id}/delete", a.requireAdmin(a.locationDelete))
@@ -511,6 +564,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /docs", a.requireAdmin(a.docsPage))
 	mux.HandleFunc("GET /admin/api/context", a.requireAdmin(a.contextPage))
 	mux.HandleFunc("GET /assets/app.css", css)
+	mux.HandleFunc("GET /forms/time-punch/{token}", a.publicTimePunchCorrectionForm)
+	mux.HandleFunc("POST /forms/time-punch/{token}", a.publicTimePunchCorrectionSubmit)
 	mux.HandleFunc("GET /api/v1/locations", a.apiAuth(a.apiLocations))
 	mux.HandleFunc("GET /api/v1/locations/{number}/employees", a.apiAuth(a.apiEmployees))
 	mux.HandleFunc("GET /api/v1/locations/{number}/employees/{employeeNumber}", a.apiAuth(a.apiEmployee))
@@ -570,7 +625,7 @@ func (a *App) locationCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	id, err := createLocation(a.db, r.FormValue("name"), r.FormValue("number"))
+	id, err := createLocation(a.db, r.FormValue("name"), r.FormValue("number"), r.FormValue("email"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -886,6 +941,131 @@ func (a *App) locationDocuments(w http.ResponseWriter, r *http.Request) {
 	a.render(w, loc.Name+" Documents", locationDocumentsHTML, map[string]any{"Location": loc, "Import": r.URL.Query()})
 }
 
+func (a *App) locationSecretLinks(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a.render(w, loc.Name+" Secret Links", locationSecretLinksHTML, map[string]any{
+		"Location":      loc,
+		"TimePunchLink": publicTimePunchURL(r, loc),
+	})
+}
+
+func (a *App) locationTimePunchCorrections(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	corrections, err := listTimePunchCorrections(a.db, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name+" Time Punch Corrections", locationTimePunchCorrectionsHTML, map[string]any{
+		"Location":    loc,
+		"Corrections": corrections,
+		"Deleted":     r.URL.Query().Get("deleted"),
+	})
+}
+
+func (a *App) locationTimePunchCorrectionDelete(w http.ResponseWriter, r *http.Request) {
+	locationID, err := pathID(r, "locationID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := getLocation(a.db, locationID); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := deleteTimePunchCorrection(a.db, locationID, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/locations/%d/time-punch-corrections?deleted=1", locationID), http.StatusSeeOther)
+}
+
+func (a *App) publicTimePunchCorrectionForm(w http.ResponseWriter, r *http.Request) {
+	loc, err := getLocationByTimePunchToken(a.db, r.PathValue("token"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, map[string]any{
+		"LoggedOut": true,
+		"Location":  loc,
+		"Today":     time.Now().Format("2006-01-02"),
+	})
+}
+
+func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Request) {
+	loc, err := getLocationByTimePunchToken(a.db, r.PathValue("token"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	input := TimePunchCorrection{
+		LocationID:   loc.ID,
+		ClockInPIN:   strings.TrimSpace(r.FormValue("clock_in_pin")),
+		BusinessDate: strings.TrimSpace(r.FormValue("business_date")),
+		StartTime:    strings.TrimSpace(r.FormValue("start_time")),
+		EndTime:      strings.TrimSpace(r.FormValue("end_time")),
+		Notes:        strings.TrimSpace(r.FormValue("notes")),
+	}
+	data := map[string]any{
+		"LoggedOut": true,
+		"Location":  loc,
+		"Today":     time.Now().Format("2006-01-02"),
+		"Form":      input,
+	}
+	if err := validateTimePunchCorrectionInput(input); err != nil {
+		data["Error"] = err.Error()
+		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+		return
+	}
+	employee, err := getEmployeeByClockInPIN(a.db, loc.ID, input.ClockInPIN)
+	if errors.Is(err, sql.ErrNoRows) {
+		data["PinMissing"] = true
+		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	input.EmployeeID = employee.ID
+	if err := createTimePunchCorrection(a.db, input); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data["Submitted"] = true
+	data["EmployeeName"] = employee.EmployeeName
+	data["Form"] = TimePunchCorrection{}
+	a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+}
+
 func (a *App) documentTimePunchWageUpload(w http.ResponseWriter, r *http.Request) {
 	locationID, err := pathID(r, "id")
 	if err != nil {
@@ -937,7 +1117,7 @@ func (a *App) locationUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := updateLocation(a.db, id, r.FormValue("name"), r.FormValue("number")); err != nil {
+	if err := updateLocation(a.db, id, r.FormValue("name"), r.FormValue("number"), r.FormValue("email")); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1669,7 +1849,7 @@ func templateFuncs() template.FuncMap {
 }
 
 func listLocations(db *sql.DB) ([]Location, error) {
-	rows, err := db.Query(`SELECT l.id, l.name, l.number, l.created_at, l.updated_at, COUNT(e.id)
+	rows, err := db.Query(`SELECT l.id, l.name, l.number, l.email, l.time_punch_token, l.created_at, l.updated_at, COUNT(e.id)
 		FROM locations l
 		LEFT JOIN employees e ON e.location_id = l.id
 		GROUP BY l.id
@@ -1682,7 +1862,7 @@ func listLocations(db *sql.DB) ([]Location, error) {
 	for rows.Next() {
 		var loc Location
 		var created, updated string
-		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated, &loc.Employees); err != nil {
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Number, &loc.Email, &loc.TimePunchToken, &created, &updated, &loc.Employees); err != nil {
 			return nil, err
 		}
 		loc.CreatedAt = parseTime(created)
@@ -1692,33 +1872,44 @@ func listLocations(db *sql.DB) ([]Location, error) {
 	return locations, rows.Err()
 }
 
-func createLocation(db *sql.DB, name, number string) (int64, error) {
-	name = strings.TrimSpace(name)
-	number = strings.TrimSpace(number)
-	if name == "" || number == "" {
-		return 0, errors.New("name and number are required")
+func createLocation(db *sql.DB, name, number, email string) (int64, error) {
+	name, number, email, err := validateLocationInput(name, number, email)
+	if err != nil {
+		return 0, err
 	}
-	res, err := db.Exec(`INSERT INTO locations (name, number) VALUES (?, ?)`, name, number)
+	res, err := db.Exec(`INSERT INTO locations (name, number, email, time_punch_token) VALUES (?, ?, ?, ?)`, name, number, email, randomToken(32))
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
-func updateLocation(db *sql.DB, id int64, name, number string) error {
+func updateLocation(db *sql.DB, id int64, name, number, email string) error {
+	name, number, email, err := validateLocationInput(name, number, email)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`UPDATE locations SET name = ?, number = ?, email = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, name, number, email, id)
+	return err
+}
+
+func validateLocationInput(name, number, email string) (string, string, string, error) {
 	name = strings.TrimSpace(name)
 	number = strings.TrimSpace(number)
-	if name == "" || number == "" {
-		return errors.New("name and number are required")
+	email = strings.TrimSpace(email)
+	if name == "" || number == "" || email == "" {
+		return "", "", "", errors.New("name, number, and email are required")
 	}
-	_, err := db.Exec(`UPDATE locations SET name = ?, number = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, name, number, id)
-	return err
+	if _, err := mail.ParseAddress(email); err != nil {
+		return "", "", "", errors.New("store email must be valid")
+	}
+	return name, number, email, nil
 }
 
 func getLocation(db *sql.DB, id int64) (Location, error) {
 	var loc Location
 	var created, updated string
-	err := db.QueryRow(`SELECT id, name, number, created_at, updated_at FROM locations WHERE id = ?`, id).Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated)
+	err := db.QueryRow(`SELECT id, name, number, email, time_punch_token, created_at, updated_at FROM locations WHERE id = ?`, id).Scan(&loc.ID, &loc.Name, &loc.Number, &loc.Email, &loc.TimePunchToken, &created, &updated)
 	loc.CreatedAt = parseTime(created)
 	loc.UpdatedAt = parseTime(updated)
 	return loc, err
@@ -1727,7 +1918,16 @@ func getLocation(db *sql.DB, id int64) (Location, error) {
 func getLocationByNumber(db *sql.DB, number string) (Location, error) {
 	var loc Location
 	var created, updated string
-	err := db.QueryRow(`SELECT id, name, number, created_at, updated_at FROM locations WHERE number = ?`, number).Scan(&loc.ID, &loc.Name, &loc.Number, &created, &updated)
+	err := db.QueryRow(`SELECT id, name, number, email, time_punch_token, created_at, updated_at FROM locations WHERE number = ?`, number).Scan(&loc.ID, &loc.Name, &loc.Number, &loc.Email, &loc.TimePunchToken, &created, &updated)
+	loc.CreatedAt = parseTime(created)
+	loc.UpdatedAt = parseTime(updated)
+	return loc, err
+}
+
+func getLocationByTimePunchToken(db *sql.DB, token string) (Location, error) {
+	var loc Location
+	var created, updated string
+	err := db.QueryRow(`SELECT id, name, number, email, time_punch_token, created_at, updated_at FROM locations WHERE time_punch_token = ?`, token).Scan(&loc.ID, &loc.Name, &loc.Number, &loc.Email, &loc.TimePunchToken, &created, &updated)
 	loc.CreatedAt = parseTime(created)
 	loc.UpdatedAt = parseTime(updated)
 	return loc, err
@@ -1985,6 +2185,15 @@ func getEmployee(db *sql.DB, locationID int64, number string) (Employee, error) 
 	return scanEmployee(row)
 }
 
+func getEmployeeByClockInPIN(db *sql.DB, locationID int64, pin string) (Employee, error) {
+	row := db.QueryRow(`SELECT e.id, e.location_id, e.employee_name, e.employee_number, e.job, e.role_id, r.name, e.department_id, d.name, e.wage_rate_cents, e.wage_pay_type, e.exclude_from_labor, e.employee_status, e.location_latest_start_date, e.birth_date, e.clock_in_pin, e.created_at, e.updated_at
+		FROM employees e
+		LEFT JOIN roles r ON r.id = e.role_id
+		LEFT JOIN departments d ON d.id = e.department_id
+		WHERE e.location_id = ? AND e.clock_in_pin = ?`, locationID, pin)
+	return scanEmployee(row)
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -2030,6 +2239,61 @@ func scanEmployee(row scanner) (Employee, error) {
 	e.CreatedAt = parseTime(created)
 	e.UpdatedAt = parseTime(updated)
 	return e, err
+}
+
+func createTimePunchCorrection(db *sql.DB, correction TimePunchCorrection) error {
+	_, err := db.Exec(`INSERT INTO time_punch_corrections (location_id, employee_id, clock_in_pin, business_date, start_time, end_time, notes) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		correction.LocationID, correction.EmployeeID, correction.ClockInPIN, correction.BusinessDate, correction.StartTime, correction.EndTime, correction.Notes)
+	return err
+}
+
+func listTimePunchCorrections(db *sql.DB, locationID int64) ([]TimePunchCorrection, error) {
+	rows, err := db.Query(`SELECT c.id, c.location_id, c.employee_id, e.employee_name, e.employee_number, c.clock_in_pin, c.business_date, c.start_time, c.end_time, c.notes, c.created_at
+		FROM time_punch_corrections c
+		JOIN employees e ON e.id = c.employee_id
+		WHERE c.location_id = ?
+		ORDER BY c.created_at DESC, c.id DESC`, locationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var corrections []TimePunchCorrection
+	for rows.Next() {
+		var correction TimePunchCorrection
+		var created string
+		if err := rows.Scan(&correction.ID, &correction.LocationID, &correction.EmployeeID, &correction.EmployeeName, &correction.EmployeeNumber, &correction.ClockInPIN, &correction.BusinessDate, &correction.StartTime, &correction.EndTime, &correction.Notes, &created); err != nil {
+			return nil, err
+		}
+		correction.CreatedAt = parseTime(created)
+		corrections = append(corrections, correction)
+	}
+	return corrections, rows.Err()
+}
+
+func deleteTimePunchCorrection(db *sql.DB, locationID, id int64) error {
+	_, err := db.Exec(`DELETE FROM time_punch_corrections WHERE location_id = ? AND id = ?`, locationID, id)
+	return err
+}
+
+func validateTimePunchCorrectionInput(correction TimePunchCorrection) error {
+	if correction.ClockInPIN == "" || correction.BusinessDate == "" || correction.StartTime == "" || correction.EndTime == "" {
+		return errors.New("clock-in PIN, date, start time, and end time are required")
+	}
+	if _, err := time.ParseInLocation("2006-01-02", correction.BusinessDate, time.Local); err != nil {
+		return errors.New("date must be valid")
+	}
+	start, err := time.Parse("15:04", correction.StartTime)
+	if err != nil {
+		return errors.New("start time must be valid")
+	}
+	end, err := time.Parse("15:04", correction.EndTime)
+	if err != nil {
+		return errors.New("end time must be valid")
+	}
+	if !end.After(start) {
+		return errors.New("end time must be after start time")
+	}
+	return nil
 }
 
 func employeeWageForNumber(tx *sql.Tx, employeeNumber string) (any, string, error) {
@@ -4205,6 +4469,17 @@ func calendarDayPath(locationID int64, date string) string {
 	return fmt.Sprintf("/locations/%d/calendar/%s", locationID, date)
 }
 
+func publicTimePunchURL(r *http.Request, loc Location) string {
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		scheme = strings.Split(forwarded, ",")[0]
+	}
+	return fmt.Sprintf("%s://%s/forms/time-punch/%s", scheme, r.Host, loc.TimePunchToken)
+}
+
 func titleWeekday(value string) string {
 	switch strings.ToLower(value) {
 	case "mon":
@@ -4846,6 +5121,7 @@ const locationFormHTML = `{{define "body"}}
   <form method="post" action="{{.Action}}" class="panel">
     <label>Name <input name="name" value="{{.Location.Name}}" required></label>
     <label>Store number <input name="number" value="{{.Location.Number}}" required></label>
+    <label>Store email <input type="email" name="email" value="{{.Location.Email}}" required></label>
     <button>{{.Mode}}</button>
   </form>
 </section>
@@ -4867,6 +5143,8 @@ const locationShowHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5019,6 +5297,8 @@ const locationDetailsHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5087,6 +5367,8 @@ const locationPayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5192,6 +5474,8 @@ const locationCalendarHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5238,6 +5522,8 @@ const locationCalendarDayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5324,6 +5610,8 @@ const locationSalesHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5381,6 +5669,8 @@ const locationDocumentsHTML = `{{define "body"}}
   <a class="active" href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5432,6 +5722,8 @@ const locationEditHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a class="active" href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.Location.ID}}/departments">Departments</a>
   <a href="/locations/{{.Location.ID}}/roles">Roles</a>
 </nav>
@@ -5441,6 +5733,7 @@ const locationEditHTML = `{{define "body"}}
     <h2>Edit location</h2>
     <label>Name <input name="name" value="{{.Location.Name}}" required></label>
     <label>Store number <input name="number" value="{{.Location.Number}}" required></label>
+    <label>Store email <input type="email" name="email" value="{{.Location.Email}}" required></label>
     <button>Save</button>
   </form>
   <section class="panel danger-zone">
@@ -5448,6 +5741,103 @@ const locationEditHTML = `{{define "body"}}
     <p class="muted">Deleting a location also deletes its employee records.</p>
     <form method="post" action="/locations/{{.Location.ID}}/delete" onsubmit="return confirm('Delete this location and its employees?')"><button class="danger">Delete location</button></form>
   </section>
+</section>
+{{end}}`
+
+const locationSecretLinksHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Secret Links</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a class="active" href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+<section class="panel">
+  <div class="section-head compact">
+    <div>
+      <h2>Time punch correction form</h2>
+      <p class="muted">Use this secret URL to create a QR code for this restaurant.</p>
+    </div>
+  </div>
+  {{if not .Location.Email}}<p class="notice bad">Set a store email on the Edit page before posting this link.</p>{{end}}
+  <label>Secret link
+    <input readonly value="{{.TimePunchLink}}" onclick="this.select()">
+  </label>
+  <p class="muted">Anyone with this link can submit a time punch correction for Store {{.Location.Number}}.</p>
+</section>
+{{end}}`
+
+const locationTimePunchCorrectionsHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Time Punch Corrections</h1>
+    <p class="muted">Store {{.Location.Number}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a class="active" href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+{{if .Deleted}}<p class="notice">Time punch correction deleted.</p>{{end}}
+<section>
+  <table>
+    <thead><tr><th>Submitted</th><th>Employee</th><th>Date</th><th>Worked</th><th>Notes</th><th></th></tr></thead>
+    <tbody>
+    {{range .Corrections}}<tr><td>{{.CreatedAt.Format "2006-01-02 15:04"}}</td><td>{{.EmployeeName}}<br><span class="muted">{{.EmployeeNumber}}</span></td><td>{{formatISODate .BusinessDate}}</td><td>{{.StartTime}}-{{.EndTime}}</td><td>{{if .Notes}}{{.Notes}}{{else}}<span class="muted">None</span>{{end}}</td><td><form method="post" action="/locations/{{$.Location.ID}}/time-punch-corrections/{{.ID}}/delete" onsubmit="return confirm('Delete this completed correction?')"><button class="danger small">Delete</button></form></td></tr>{{else}}<tr><td colspan="6">No time punch corrections are waiting.</td></tr>{{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}`
+
+const publicTimePunchCorrectionHTML = `{{define "body"}}
+<section class="narrow">
+  <h1>Time Punch Correction</h1>
+  <p class="muted">{{.Location.Name}} | Store {{.Location.Number}}</p>
+  {{if .Submitted}}<p class="notice">Your correction was submitted for {{.EmployeeName}}.</p>{{end}}
+  {{if .Error}}<p class="notice bad">{{.Error}}</p>{{end}}
+  {{if .PinMissing}}
+    <section class="notice bad">
+      <strong>We could not find that clock-in PIN for this store.</strong>
+      {{if .Location.Email}}
+      <p>Email your time punch correction to {{.Location.Email}}. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</p>
+      <p>No pudimos encontrar ese PIN de reloj para esta tienda. Envie su correccion de horas a {{.Location.Email}}. Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.</p>
+      {{else}}
+      <p>Email your time punch correction to the store. Include your name, the date, the time you started, the time you left, and any notes. Make sure your email has a subject line or it may go to spam.</p>
+      <p>Envie su correccion de horas a la tienda. Incluya su nombre, la fecha, la hora en que empezo, la hora en que salio y cualquier nota. Asegurese de incluir un asunto en el correo o puede ir a spam.</p>
+      {{end}}
+    </section>
+  {{end}}
+  <form method="post" class="panel">
+    <label>Clock-in PIN <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" required></label>
+    <label>Date <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
+    <label>Shift started <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
+    <label>Shift ended <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
+    <label>Notes <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
+    <button>Submit correction</button>
+  </form>
 </section>
 {{end}}`
 
@@ -5617,6 +6007,8 @@ const rolesHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a href="/locations/{{.SelectedLocation.ID}}/labor">Labor</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/secret-links">Secret Links</a>
   <a href="/locations/{{.SelectedLocation.ID}}/departments">Departments</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/roles">Roles</a>
 </nav>
@@ -5741,6 +6133,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls,.upload-grid{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label{margin-bottom:12px}.upload-grid>div+div{margin-top:18px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

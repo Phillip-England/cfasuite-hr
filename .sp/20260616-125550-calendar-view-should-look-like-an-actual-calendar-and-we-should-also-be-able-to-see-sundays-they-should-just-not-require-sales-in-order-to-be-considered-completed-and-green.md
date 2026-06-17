@@ -2,6 +2,7 @@
 title: "calendar view should look like an actual calendar and we should also be able to see sundays they should just not require sales in order to be considered completed and green"
 created_at: "2026-06-16T12:55:50Z"
 slug: "calendar-view-should-look-like-an-actual-calendar-and-we-should-also-be-able-to-see-sundays-they-should-just-not-require-sales-in-order-to-be-considered-completed-and-green"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # calendar view should look like an actual calendar and we should also be able to see sundays they should just not require sales in order to be considered completed and green

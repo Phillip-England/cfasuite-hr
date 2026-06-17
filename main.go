@@ -2671,14 +2671,15 @@ func salesDatesForCalendar(db *sql.DB, locationID int64, month time.Time) (map[s
 }
 
 func salesRangeFromRequest(r *http.Request) (time.Time, time.Time, error) {
-	now := time.Now()
+	now := startOfDay(time.Now())
+	defaultEnd := now.AddDate(0, 0, -1)
 	startValue := strings.TrimSpace(r.URL.Query().Get("start"))
 	endValue := strings.TrimSpace(r.URL.Query().Get("end"))
 	if startValue == "" {
 		startValue = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local).Format("2006-01-02")
 	}
 	if endValue == "" {
-		endValue = time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.Local).Format("2006-01-02")
+		endValue = defaultEnd.Format("2006-01-02")
 	}
 	start, err := time.ParseInLocation("2006-01-02", startValue, time.Local)
 	if err != nil {
@@ -2695,12 +2696,19 @@ func salesRangeFromRequest(r *http.Request) (time.Time, time.Time, error) {
 }
 
 func missingSalesDates(start, end time.Time, sales []DailySales) []string {
+	return missingSalesDatesBefore(start, end, sales, startOfDay(time.Now()))
+}
+
+func missingSalesDatesBefore(start, end time.Time, sales []DailySales, today time.Time) []string {
 	present := map[string]bool{}
 	for _, sale := range sales {
 		present[sale.BusinessDate] = true
 	}
 	var missing []string
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		if !d.Before(today) {
+			continue
+		}
 		if d.Weekday() == time.Sunday {
 			continue
 		}
@@ -2713,8 +2721,15 @@ func missingSalesDates(start, end time.Time, sales []DailySales) []string {
 }
 
 func requiredSalesDateCount(start, end time.Time) int {
+	return requiredSalesDateCountBefore(start, end, startOfDay(time.Now()))
+}
+
+func requiredSalesDateCountBefore(start, end, today time.Time) int {
 	count := 0
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		if !d.Before(today) {
+			continue
+		}
 		if d.Weekday() != time.Sunday {
 			count++
 		}
@@ -2957,19 +2972,23 @@ func laborRangeFromRequest(r *http.Request) (time.Time, time.Time, error) {
 	if end.Before(start) {
 		return time.Time{}, time.Time{}, errors.New("end must be on or after start")
 	}
-	if !end.Before(now) {
-		return time.Time{}, time.Time{}, errors.New("labor reports can only include completed past days")
-	}
 	return start, end, nil
 }
 
 func missingLaborDates(start, end time.Time, labor []DailyLabor) []string {
+	return missingLaborDatesBefore(start, end, labor, startOfDay(time.Now()))
+}
+
+func missingLaborDatesBefore(start, end time.Time, labor []DailyLabor, today time.Time) []string {
 	present := map[string]bool{}
 	for _, day := range labor {
 		present[day.BusinessDate] = true
 	}
 	var missing []string
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		if !d.Before(today) {
+			continue
+		}
 		if d.Weekday() == time.Sunday {
 			continue
 		}

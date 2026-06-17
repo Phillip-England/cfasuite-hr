@@ -2,6 +2,7 @@
 title: "still a few issues with uploading clock in pins"
 created_at: "2026-06-16T04:28:16Z"
 slug: "still-a-few-issues-with-uploading-clock-in-pins"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # still a few issues with uploading clock in pins

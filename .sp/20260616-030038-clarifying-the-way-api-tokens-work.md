@@ -2,6 +2,7 @@
 title: "clarifying the way api tokens work"
 created_at: "2026-06-16T03:00:38Z"
 slug: "clarifying-the-way-api-tokens-work"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # clarifying the way api tokens work

@@ -2,6 +2,7 @@
 title: "adding clock in pin support"
 created_at: "2026-06-16T03:12:08Z"
 slug: "adding-clock-in-pin-support"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # adding clock in pin support

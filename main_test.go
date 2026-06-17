@@ -706,6 +706,30 @@ func TestMissingSalesDatesSkipsSundays(t *testing.T) {
 	}
 }
 
+func TestMissingSalesDatesIgnoresTodayAndFutureDates(t *testing.T) {
+	start := time.Date(2026, time.June, 15, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, time.June, 20, 0, 0, 0, 0, time.Local)
+	today := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.Local)
+	missing := missingSalesDatesBefore(start, end, nil, today)
+	if len(missing) != 2 || missing[0] != "2026-06-15" || missing[1] != "2026-06-16" {
+		t.Fatalf("unexpected missing dates: %#v", missing)
+	}
+	count := requiredSalesDateCountBefore(start, end, today)
+	if count != 2 {
+		t.Fatalf("expected 2 required past dates, got %d", count)
+	}
+}
+
+func TestMissingLaborDatesIgnoresTodayAndFutureDates(t *testing.T) {
+	start := time.Date(2026, time.June, 15, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, time.June, 20, 0, 0, 0, 0, time.Local)
+	today := time.Date(2026, time.June, 17, 0, 0, 0, 0, time.Local)
+	missing := missingLaborDatesBefore(start, end, []DailyLabor{{BusinessDate: "2026-06-15"}}, today)
+	if len(missing) != 1 || missing[0] != "2026-06-16" {
+		t.Fatalf("unexpected missing dates: %#v", missing)
+	}
+}
+
 func TestMatchPinEmployeeIDHandlesExactReportName(t *testing.T) {
 	employees := []pinImportEmployee{{ID: 1, Name: "Vasquez, Rafael"}}
 	employees[0].Keys = pinNameKeys(employees[0].Name)

@@ -2,6 +2,7 @@
 title: "system is not capturing overtime information from time punch sheet correctly"
 created_at: "2026-06-16T15:15:51Z"
 slug: "system-is-not-capturing-overtime-information-from-time-punch-sheet-correctly"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # system is not capturing overtime information from time punch sheet correctly

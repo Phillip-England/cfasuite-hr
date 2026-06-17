@@ -2,6 +2,7 @@
 title: "the sales page calendar days are not clickable they should be"
 created_at: "2026-06-16T15:38:05Z"
 slug: "the-sales-page-calendar-days-are-not-clickable-they-should-be"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # the sales page calendar days are not clickable they should be

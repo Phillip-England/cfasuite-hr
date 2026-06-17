@@ -2,6 +2,7 @@
 title: "make roles and departments sub menus of a location instead of existing in the main nav menu"
 created_at: "2026-06-15T21:25:10Z"
 slug: "make-roles-and-departments-sub-menus-of-a-location-instead-of-existing-in-the-main-nav-menu"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # make roles and departments sub menus of a location instead of existing in the main nav menu

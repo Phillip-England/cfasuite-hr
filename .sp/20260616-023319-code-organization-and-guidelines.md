@@ -2,6 +2,7 @@
 title: "code organization and guidelines"
 created_at: "2026-06-16T02:33:19Z"
 slug: "code-organization-and-guidelines"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # code organization and guidelines

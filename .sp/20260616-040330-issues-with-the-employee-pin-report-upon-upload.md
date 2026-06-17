@@ -2,6 +2,7 @@
 title: "issues with the employee pin report upon upload"
 created_at: "2026-06-16T04:03:30Z"
 slug: "issues-with-the-employee-pin-report-upon-upload"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # issues with the employee pin report upon upload

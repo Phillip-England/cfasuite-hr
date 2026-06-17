@@ -2,6 +2,7 @@
 title: "addition of seesales application for sales parsing"
 created_at: "2026-06-16T11:36:16Z"
 slug: "addition-of-seesales-application-for-sales-parsing"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # addition of seesales application for sales parsing

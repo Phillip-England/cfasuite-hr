@@ -2,6 +2,7 @@
 title: "creating a new page with employee data"
 created_at: "2026-06-16T03:14:40Z"
 slug: "creating-a-new-page-with-employee-data"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # creating a new page with employee data

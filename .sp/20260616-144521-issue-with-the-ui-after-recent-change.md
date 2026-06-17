@@ -2,6 +2,7 @@
 title: "issue with the UI after recent change"
 created_at: "2026-06-16T14:45:21Z"
 slug: "issue-with-the-ui-after-recent-change"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # issue with the UI after recent change

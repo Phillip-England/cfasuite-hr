@@ -2,6 +2,7 @@
 title: "more clarity on the database migration"
 created_at: "2026-06-15T21:07:32Z"
 slug: "more-clarity-on-the-database-migration"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # more clarity on the database migration

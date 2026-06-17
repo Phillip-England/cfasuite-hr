@@ -2,6 +2,7 @@
 title: "creating a simple migration script that deletes itself after use"
 created_at: "2026-06-15T21:05:58Z"
 slug: "creating-a-simple-migration-script-that-deletes-itself-after-use"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # creating a simple migration script that deletes itself after use

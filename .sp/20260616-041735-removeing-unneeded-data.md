@@ -2,6 +2,7 @@
 title: "removeing unneeded data"
 created_at: "2026-06-16T04:17:35Z"
 slug: "removeing-unneeded-data"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # removeing unneeded data

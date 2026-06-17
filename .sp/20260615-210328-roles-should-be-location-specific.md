@@ -2,6 +2,7 @@
 title: "roles should be location-specific"
 created_at: "2026-06-15T21:03:28Z"
 slug: "roles-should-be-location-specific"
+copied_at: "2026-06-17T08:35:56Z"
 ---
 
 # roles should be location-specific

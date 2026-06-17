@@ -184,6 +184,45 @@ type MonthlyProductivityGoal struct {
 	UpdatedAt        time.Time
 }
 
+type ProductivityReport struct {
+	LocationID         int64
+	Month              string
+	MonthLabel         string
+	PrevMonth          string
+	NextMonth          string
+	GoalBasisPoints    int64
+	GoalDisplayValue   string
+	Rows               []ProductivityRow
+	Chart              []ProductivityChartPoint
+	TotalSalesCents    int64
+	TotalLaborMinutes  int
+	AverageBasisPoints int64
+	MissingDates       []string
+}
+
+type ProductivityRow struct {
+	Date                    string
+	DateLabel               string
+	Weekday                 string
+	SalesCents              int64
+	LaborMinutes            int
+	LaborHours              string
+	ProductivityBasisPoints int64
+	ProductivityDisplay     string
+	TargetBasisPoints       int64
+	TargetDisplay           string
+	GapBasisPoints          int64
+	GapDisplay              string
+}
+
+type ProductivityChartPoint struct {
+	Date   string  `json:"date"`
+	Label  string  `json:"label"`
+	Actual float64 `json:"actual"`
+	Target float64 `json:"target"`
+	Gap    float64 `json:"gap"`
+}
+
 type SalesBreakdownRow struct {
 	Label   string
 	Cents   int64

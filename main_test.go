@@ -57,6 +57,49 @@ func TestConfiguredDBPathKeepsLegacyDefault(t *testing.T) {
 	}
 }
 
+func TestProductivityReportCombinesSalesLaborAndGoal(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	if err := saveMonthlyProductivityGoal(db, locationID, "2026-01", 8240); err != nil {
+		t.Fatalf("saveMonthlyProductivityGoal: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO daily_sales (location_id, business_date, total_cents) VALUES (?, ?, ?)`, locationID, "2026-01-02", int64(3447356)); err != nil {
+		t.Fatalf("insert sales: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO daily_labor (location_id, business_date, total_minutes, overtime_minutes, total_wages_cents) VALUES (?, ?, ?, 0, 0)`, locationID, "2026-01-02", 26655); err != nil {
+		t.Fatalf("insert labor: %v", err)
+	}
+	month := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.Local)
+	today := time.Date(2026, time.January, 3, 0, 0, 0, 0, time.Local)
+	report, err := productivityReport(db, locationID, month, today)
+	if err != nil {
+		t.Fatalf("productivityReport: %v", err)
+	}
+	if report.GoalDisplayValue != "82.4" {
+		t.Fatalf("GoalDisplayValue = %q, want 82.4", report.GoalDisplayValue)
+	}
+	if len(report.Rows) != 1 {
+		t.Fatalf("expected 1 complete productivity row, got %d", len(report.Rows))
+	}
+	row := report.Rows[0]
+	if row.Date != "2026-01-02" || row.ProductivityDisplay != "77.6" || row.GapDisplay != "-4.8" {
+		t.Fatalf("unexpected productivity row: %#v", row)
+	}
+	if len(report.MissingDates) != 1 || report.MissingDates[0] != "2026-01-01" {
+		t.Fatalf("unexpected missing dates: %#v", report.MissingDates)
+	}
+}
+
 func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -609,6 +610,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/sales", a.requireAdmin(a.locationSalesUpload))
 	mux.HandleFunc("POST /locations/{id}/calendar/{date}/labor", a.requireAdmin(a.locationLaborUpload))
 	mux.HandleFunc("GET /locations/{id}/sales", a.requireAdmin(a.locationSales))
+	mux.HandleFunc("GET /locations/{id}/productivity", a.requireAdmin(a.locationProductivity))
 	mux.HandleFunc("GET /locations/{id}/documents", a.requireAdmin(a.locationDocuments))
 	mux.HandleFunc("GET /locations/{id}/secret-links", a.requireAdmin(a.locationSecretLinks))
 	mux.HandleFunc("GET /locations/{id}/time-punch-corrections", a.requireAdmin(a.locationTimePunchCorrections))
@@ -1227,6 +1229,33 @@ func (a *App) locationSales(w http.ResponseWriter, r *http.Request) {
 		"DestinationRows":   aggregateSalesRows(sales, "destination"),
 		"DayOfWeekRows":     dayOfWeekSalesRows(sales),
 		"SelectedDateCount": requiredSalesDateCount(start, end),
+	})
+}
+
+func (a *App) locationProductivity(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	loc, err := getLocation(a.db, id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	month, err := calendarMonthFromRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	report, err := productivityReport(a.db, id, month, startOfDay(time.Now()))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	a.render(w, loc.Name+" Productivity", locationProductivityHTML, map[string]any{
+		"Location": loc,
+		"Report":   report,
 	})
 }
 
@@ -2207,6 +2236,8 @@ func templateFuncs() template.FuncMap {
 		"formatMoney": func(cents int64) string {
 			return formatDollars(cents)
 		},
+		"formatProductivity": formatProductivityGoal,
+		"formatChartJSON":    formatChartJSON,
 		"formatHours":        formatHours,
 		"formatISODate":      formatISODate,
 		"calendarDayPath":    calendarDayPath,
@@ -3636,6 +3667,98 @@ func salesRowsForLabels(values map[string]int64, labels []string) []SalesBreakdo
 		rows = append(rows, SalesBreakdownRow{Label: label, Cents: values[label], Percent: formatPercent(values[label], total)})
 	}
 	return rows
+}
+
+func productivityReport(db *sql.DB, locationID int64, month time.Time, today time.Time) (ProductivityReport, error) {
+	first := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.Local)
+	end := first.AddDate(0, 1, -1)
+	if yesterday := today.AddDate(0, 0, -1); end.After(yesterday) {
+		end = yesterday
+	}
+	report := ProductivityReport{
+		LocationID:   locationID,
+		Month:        first.Format("2006-01"),
+		MonthLabel:   first.Format("January 2006"),
+		PrevMonth:    first.AddDate(0, -1, 0).Format("2006-01"),
+		NextMonth:    first.AddDate(0, 1, 0).Format("2006-01"),
+		MissingDates: []string{},
+	}
+	goal, err := getMonthlyProductivityGoal(db, locationID, report.Month)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ProductivityReport{}, err
+	}
+	report.GoalBasisPoints = goal.GoalBasisPoints
+	report.GoalDisplayValue = goal.GoalDisplayValue
+	if end.Before(first) {
+		return report, nil
+	}
+	sales, err := listDailySales(db, locationID, first.Format("2006-01-02"), end.Format("2006-01-02"))
+	if err != nil {
+		return ProductivityReport{}, err
+	}
+	labor, err := listDailyLabor(db, locationID, first.Format("2006-01-02"), end.Format("2006-01-02"))
+	if err != nil {
+		return ProductivityReport{}, err
+	}
+	salesByDate := map[string]DailySales{}
+	for _, sale := range sales {
+		salesByDate[sale.BusinessDate] = sale
+	}
+	laborByDate := map[string]DailyLabor{}
+	for _, day := range labor {
+		laborByDate[day.BusinessDate] = day
+	}
+	for d := first; !d.After(end); d = d.AddDate(0, 0, 1) {
+		if d.Weekday() == time.Sunday {
+			continue
+		}
+		date := d.Format("2006-01-02")
+		sale, hasSales := salesByDate[date]
+		day, hasLabor := laborByDate[date]
+		if !hasSales || !hasLabor || day.TotalMinutes <= 0 {
+			report.MissingDates = append(report.MissingDates, date)
+			continue
+		}
+		productivity := productivityBasisPoints(sale.TotalCents, day.TotalMinutes)
+		gap := productivity - report.GoalBasisPoints
+		row := ProductivityRow{
+			Date:                    date,
+			DateLabel:               formatISODate(date),
+			Weekday:                 d.Format("Monday"),
+			SalesCents:              sale.TotalCents,
+			LaborMinutes:            day.TotalMinutes,
+			LaborHours:              formatHours(day.TotalMinutes),
+			ProductivityBasisPoints: productivity,
+			ProductivityDisplay:     formatProductivityGoal(productivity),
+			TargetBasisPoints:       report.GoalBasisPoints,
+			TargetDisplay:           formatProductivityGoal(report.GoalBasisPoints),
+			GapBasisPoints:          gap,
+			GapDisplay:              formatProductivityGap(gap),
+		}
+		report.Rows = append(report.Rows, row)
+		report.Chart = append(report.Chart, ProductivityChartPoint{
+			Date:   date,
+			Label:  d.Format("01/02"),
+			Actual: basisPointsFloat(productivity),
+			Target: basisPointsFloat(report.GoalBasisPoints),
+			Gap:    basisPointsFloat(gap),
+		})
+		report.TotalSalesCents += sale.TotalCents
+		report.TotalLaborMinutes += day.TotalMinutes
+	}
+	report.AverageBasisPoints = productivityBasisPoints(report.TotalSalesCents, report.TotalLaborMinutes)
+	return report, nil
+}
+
+func productivityBasisPoints(salesCents int64, laborMinutes int) int64 {
+	if laborMinutes <= 0 {
+		return 0
+	}
+	return int64(math.Round(float64(salesCents) * 60 / float64(laborMinutes)))
+}
+
+func basisPointsFloat(value int64) float64 {
+	return float64(value) / 100
 }
 
 func saveDailyLabor(db *sql.DB, locationID int64, date string, report TimePunchReport) error {
@@ -5095,6 +5218,14 @@ func formatPercent(part, total int64) string {
 	return fmt.Sprintf("%.1f%%", float64(part)*100/float64(total))
 }
 
+func formatChartJSON(points []ProductivityChartPoint) template.JS {
+	data, err := json.Marshal(points)
+	if err != nil {
+		return "[]"
+	}
+	return template.JS(data)
+}
+
 func formatDollars(cents int64) string {
 	sign := ""
 	if cents < 0 {
@@ -5521,13 +5652,26 @@ func parseProductivityGoal(value string) (int64, error) {
 }
 
 func formatProductivityGoal(value int64) string {
+	sign := ""
+	if value < 0 {
+		sign = "-"
+		value = -value
+	}
 	whole := value / 100
 	fraction := value % 100
 	if fraction == 0 {
-		return strconv.FormatInt(whole, 10)
+		return sign + strconv.FormatInt(whole, 10)
 	}
 	out := fmt.Sprintf("%d.%02d", whole, fraction)
-	return strings.TrimRight(out, "0")
+	return sign + strings.TrimRight(out, "0")
+}
+
+func formatProductivityGap(value int64) string {
+	sign := ""
+	if value > 0 {
+		sign = "+"
+	}
+	return sign + formatProductivityGoal(value)
 }
 
 func calendarDays(month, today time.Time, salesDates, laborDates map[string]bool) []CalendarDay {
@@ -6116,6 +6260,7 @@ const locationCalendarHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a class="active" href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/productivity?month={{.MonthValue}}">Productivity</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
@@ -6171,6 +6316,7 @@ const locationCalendarDayHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a class="active" href="/locations/{{.Location.ID}}/calendar?month={{.MonthValue}}">Calendar</a>
   <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/productivity?month={{.MonthValue}}">Productivity</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
@@ -6259,6 +6405,7 @@ const locationSalesHTML = `{{define "body"}}
   <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.Location.ID}}/calendar">Calendar</a>
   <a class="active" href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a href="/locations/{{.Location.ID}}/productivity">Productivity</a>
   <a href="/locations/{{.Location.ID}}/documents">Documents</a>
   <a href="/locations/{{.Location.ID}}/edit">Edit</a>
   <a href="/locations/{{.Location.ID}}/labor">Labor</a>
@@ -6303,6 +6450,167 @@ const locationSalesHTML = `{{define "body"}}
     <p>Missing required non-Sunday dates: {{range .MissingDates}}<a class="missing-date-link" href="{{calendarDayPath $.Location.ID .}}">{{formatISODate .}}</a> {{end}}</p>
   </section>
 {{end}}
+{{end}}`
+
+const locationProductivityHTML = `{{define "body"}}
+<div class="row">
+  <div>
+    <h1>{{.Location.Name}} Productivity</h1>
+    <p class="muted">Store {{.Location.Number}} | {{.Report.MonthLabel}}</p>
+  </div>
+</div>
+<nav class="portal-menu">
+  <a href="/locations/{{.Location.ID}}">Overview</a>
+  <a href="/locations/{{.Location.ID}}/details">Employee Details</a>
+  <a href="/locations/{{.Location.ID}}/pay">Employee Pay</a>
+  <a href="/locations/{{.Location.ID}}/calendar?month={{.Report.Month}}">Calendar</a>
+  <a href="/locations/{{.Location.ID}}/sales">Sales</a>
+  <a class="active" href="/locations/{{.Location.ID}}/productivity?month={{.Report.Month}}">Productivity</a>
+  <a href="/locations/{{.Location.ID}}/documents">Documents</a>
+  <a href="/locations/{{.Location.ID}}/edit">Edit</a>
+  <a href="/locations/{{.Location.ID}}/labor">Labor</a>
+  <a href="/locations/{{.Location.ID}}/time-punch-corrections">Time Punch Corrections</a>
+  <a href="/locations/{{.Location.ID}}/secret-links">Secret Links</a>
+  <a href="/locations/{{.Location.ID}}/departments">Departments</a>
+  <a href="/locations/{{.Location.ID}}/roles">Roles</a>
+</nav>
+<section class="panel">
+  <div class="calendar-head">
+    <a class="button secondary" href="/locations/{{.Location.ID}}/productivity?month={{.Report.PrevMonth}}">Previous</a>
+    <h2>{{.Report.MonthLabel}}</h2>
+    <a class="button secondary" href="/locations/{{.Location.ID}}/productivity?month={{.Report.NextMonth}}">Next</a>
+  </div>
+  {{if .Report.GoalDisplayValue}}
+    <div class="overview-grid">
+      <article class="metric"><span>Completed days</span><strong>{{len .Report.Rows}}</strong></article>
+      <article class="metric"><span>Total sales</span><strong>{{formatMoney .Report.TotalSalesCents}}</strong></article>
+      <article class="metric"><span>Time punch hours</span><strong>{{formatHours .Report.TotalLaborMinutes}}</strong></article>
+      <article class="metric"><span>Average productivity</span><strong>{{formatProductivity .Report.AverageBasisPoints}}</strong><em>Goal {{.Report.GoalDisplayValue}}</em></article>
+    </div>
+    {{if .Report.Chart}}
+      <div class="productivity-chart-wrap">
+        <canvas id="productivity-chart" class="productivity-chart" width="1040" height="430" aria-label="Productivity versus target chart"></canvas>
+      </div>
+    {{else}}
+      <p class="empty">No complete sales and labor days are available for this month yet.</p>
+    {{end}}
+  {{else}}
+    <p class="notice bad">Set a productivity goal on the {{.Report.MonthLabel}} calendar before generating this graph.</p>
+  {{end}}
+</section>
+{{if .Report.MissingDates}}
+<section class="notice bad">
+  <strong>Some dates are not included in the graph.</strong>
+  <p>Missing sales, labor, or time punch hours: {{range .Report.MissingDates}}<a class="missing-date-link" href="{{calendarDayPath $.Location.ID .}}">{{formatISODate .}}</a> {{end}}</p>
+</section>
+{{end}}
+{{if .Report.Rows}}
+<section>
+  <h2>Daily productivity</h2>
+  <table><thead><tr><th>Date</th><th>Day</th><th>Sales</th><th>Time punch hours</th><th>Productivity</th><th>Target</th><th>Gap</th></tr></thead><tbody>{{range .Report.Rows}}<tr><td><a class="table-link" href="{{calendarDayPath $.Location.ID .Date}}">{{.DateLabel}}</a></td><td>{{.Weekday}}</td><td>{{formatMoney .SalesCents}}</td><td>{{.LaborHours}}</td><td>{{.ProductivityDisplay}}</td><td>{{.TargetDisplay}}</td><td class="{{if lt .GapBasisPoints 0}}negative{{else}}positive{{end}}">{{.GapDisplay}}</td></tr>{{end}}</tbody></table>
+</section>
+{{end}}
+<script>
+(() => {
+  const canvas = document.getElementById('productivity-chart');
+  if (!canvas) return;
+  const points = {{formatChartJSON .Report.Chart}};
+  if (!points.length) return;
+  const ctx = canvas.getContext('2d');
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || canvas.width;
+  const cssHeight = canvas.clientHeight || canvas.height;
+  canvas.width = Math.round(cssWidth * ratio);
+  canvas.height = Math.round(cssHeight * ratio);
+  ctx.scale(ratio, ratio);
+
+  const pad = {top: 26, right: 26, bottom: 72, left: 58};
+  const width = cssWidth - pad.left - pad.right;
+  const height = cssHeight - pad.top - pad.bottom;
+  const values = points.flatMap(point => [point.actual, point.target]);
+  let min = Math.floor((Math.min(...values) - 5) / 5) * 5;
+  let max = Math.ceil((Math.max(...values) + 5) / 5) * 5;
+  if (min === max) max = min + 10;
+  const x = index => pad.left + (points.length === 1 ? width / 2 : index * width / (points.length - 1));
+  const y = value => pad.top + (max - value) * height / (max - min);
+
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, cssWidth, cssHeight);
+  ctx.strokeStyle = '#303030';
+  ctx.fillStyle = '#a3a3a3';
+  ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let step = 0; step <= 5; step++) {
+    const value = min + (max - min) * step / 5;
+    const yy = y(value);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, yy);
+    ctx.lineTo(pad.left + width, yy);
+    ctx.stroke();
+    ctx.fillText(value.toFixed(0), pad.left - 10, yy);
+  }
+
+  for (let i = 0; i < points.length - 1; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x(i), y(points[i].target));
+    ctx.lineTo(x(i), y(points[i].actual));
+    ctx.lineTo(x(i + 1), y(points[i + 1].actual));
+    ctx.lineTo(x(i + 1), y(points[i + 1].target));
+    ctx.closePath();
+    ctx.fillStyle = ((points[i].actual + points[i + 1].actual) / 2 >= (points[i].target + points[i + 1].target) / 2) ? 'rgba(34,197,94,.18)' : 'rgba(239,68,68,.18)';
+    ctx.fill();
+  }
+
+  const drawLine = (key, color, dash = []) => {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const xx = x(index);
+      const yy = y(point[key]);
+      if (index === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+    });
+    ctx.stroke();
+    ctx.restore();
+  };
+  drawLine('target', '#3b82f6', [6, 5]);
+  drawLine('actual', '#f97316');
+
+  points.forEach((point, index) => {
+    const xx = x(index);
+    ctx.fillStyle = '#3b82f6';
+    ctx.beginPath();
+    ctx.arc(xx, y(point.target), 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#f97316';
+    ctx.beginPath();
+    ctx.arc(xx, y(point.actual), 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.save();
+    ctx.translate(xx, pad.top + height + 14);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#a3a3a3';
+    ctx.fillText(point.label, 0, 4);
+    ctx.restore();
+  });
+
+  ctx.fillStyle = '#f5f5f5';
+  ctx.font = '700 14px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Actual productivity', pad.left, 18);
+  ctx.fillStyle = '#f97316';
+  ctx.fillRect(pad.left + 138, 10, 18, 3);
+  ctx.fillStyle = '#f5f5f5';
+  ctx.fillText('Target', pad.left + 174, 18);
+  ctx.fillStyle = '#3b82f6';
+  ctx.fillRect(pad.left + 226, 10, 18, 3);
+})();
+</script>
 {{end}}`
 
 const locationDocumentsHTML = `{{define "body"}}
@@ -6792,6 +7100,7 @@ const laborHTML = `{{define "body"}}
   <a href="/locations/{{.SelectedLocation.ID}}/pay">Employee Pay</a>
   <a href="/locations/{{.SelectedLocation.ID}}/calendar">Calendar</a>
   <a href="/locations/{{.SelectedLocation.ID}}/sales">Sales</a>
+  <a href="/locations/{{.SelectedLocation.ID}}/productivity">Productivity</a>
   <a href="/locations/{{.SelectedLocation.ID}}/documents">Documents</a>
   <a href="/locations/{{.SelectedLocation.ID}}/edit">Edit</a>
   <a class="active" href="/locations/{{.SelectedLocation.ID}}/labor">Labor</a>
@@ -7071,6 +7380,6 @@ const docsHTML = `{{define "body"}}
 
 const appCSS = `
 :root{color-scheme:dark;--bg:#050505;--panel:#111;--line:#262626;--text:#f5f5f5;--muted:#a3a3a3;--accent:#e51636;--bad:#ff6363}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.profile-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.profile-grid .panel:last-child{grid-column:1/-1}.profile-photo-panel{display:grid;gap:14px;justify-items:start}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px;font-size:16px;line-height:1.3}input[type=date],input[type=time]{min-height:44px;text-align:left;-webkit-appearance:none;appearance:none}input[type=date]::-webkit-date-and-time-value,input[type=time]::-webkit-date-and-time-value{text-align:left}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-name-link{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-weight:700;text-decoration:none}.employee-name-link:hover{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.avatar{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;border:1px solid var(--line);border-radius:999px;background:#111;color:var(--muted);font-weight:800;text-transform:uppercase}.avatar.tiny{width:34px;height:34px;min-width:34px}.avatar.large{width:220px;height:220px;font-size:64px}.photo-flag{border:1px solid #5f4b12;background:#171202;color:#ffd66b;border-radius:6px;padding:2px 6px;font-size:12px}.public-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}.public-page-head h1{margin-bottom:8px}.language-toggle{display:flex;gap:6px;flex-wrap:nowrap}.language-toggle button{white-space:nowrap}.language-toggle button.active{background:var(--accent);color:white}.photo-warning{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.72)}.photo-warning-box{width:min(420px,100%);background:var(--panel);border:1px solid var(--bad);border-radius:8px;padding:20px;box-shadow:0 18px 60px rgba(0,0,0,.5)}.photo-warning-box strong{display:block;color:#ffd0d0;font-size:18px;line-height:1.25}.photo-warning-box p{color:var(--muted);margin:10px 0 18px}[hidden]{display:none!important}.cropper{display:grid;gap:12px;justify-items:start}.crop-canvas{width:min(320px,100%);height:auto;border:1px solid var(--line);border-radius:8px;background:#050505}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.goal-form{display:grid;grid-template-columns:minmax(180px,280px) auto;gap:12px;align-items:end;margin:0 0 18px}.goal-form label{margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}a{color:inherit}header{min-height:64px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#090909;position:sticky;top:0;z-index:10}nav{display:flex;gap:16px;align-items:center}nav a,.brand{text-decoration:none}.brand-wrap{display:flex;align-items:center;gap:12px}.brand{font-weight:800}.location-context{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:14px;font-weight:700}main{max-width:1120px;margin:0 auto;padding:32px 24px 64px}h1{font-size:34px;margin:0 0 18px}h2{font-size:20px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}.row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}.actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}.card,.panel,.notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}.day-panel{padding:16px}.status-list{display:grid;gap:10px;margin-bottom:16px}.status-list:empty{display:none}.day-panel .notice{margin:0}.data-block{margin-top:18px}.upload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}.day-panel .labor-upload{margin-bottom:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px}.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:28px}.profile-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.profile-grid .panel:last-child{grid-column:1/-1}.profile-photo-panel{display:grid;gap:14px;justify-items:start}.portal-menu{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);margin:-8px 0 28px;padding-bottom:12px}.portal-menu a{color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:8px 12px;text-decoration:none}.portal-menu a.active{background:#222;color:var(--text);border-color:#3a3a3a}.narrow{max-width:520px;margin:8vh auto}.muted{color:var(--muted)}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:8px}.bad{border-color:var(--bad);color:#ffd0d0}.positive{color:#86efac}.negative{color:#fca5a5}.danger-zone{border-color:#4a1f1f}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}form{margin:0}label{display:block;color:var(--muted);margin-bottom:14px}input,select,textarea{width:100%;margin-top:6px;background:#050505;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:11px 12px;font-size:16px;line-height:1.3}input[type=date],input[type=time]{min-height:44px;text-align:left;-webkit-appearance:none;appearance:none}input[type=date]::-webkit-date-and-time-value,input[type=time]::-webkit-date-and-time-value{text-align:left}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--accent)}button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:40px;background:var(--accent);color:white;border:0;border-radius:6px;padding:0 14px;text-decoration:none;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#222}.ghost{background:transparent;border:1px solid var(--line);color:var(--muted)}.danger{background:#7f1d1d}.small{min-height:32px;padding:0 10px}.inline{display:flex;gap:14px;align-items:end;margin-bottom:22px}.inline label{flex:1;margin:0}.table-form{margin:0}.table-link{color:var(--text);font-weight:700;text-decoration:underline;text-decoration-color:#3a3a3a;text-underline-offset:3px}.table-link:hover{color:white;text-decoration-color:var(--accent)}.employee-name-link{display:inline-flex;align-items:center;gap:8px;color:var(--text);font-weight:700;text-decoration:none}.employee-name-link:hover{text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px}.avatar{display:inline-flex;align-items:center;justify-content:center;object-fit:cover;border:1px solid var(--line);border-radius:999px;background:#111;color:var(--muted);font-weight:800;text-transform:uppercase}.avatar.tiny{width:34px;height:34px;min-width:34px}.avatar.large{width:220px;height:220px;font-size:64px}.photo-flag{border:1px solid #5f4b12;background:#171202;color:#ffd66b;border-radius:6px;padding:2px 6px;font-size:12px}.public-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}.public-page-head h1{margin-bottom:8px}.language-toggle{display:flex;gap:6px;flex-wrap:nowrap}.language-toggle button{white-space:nowrap}.language-toggle button.active{background:var(--accent);color:white}.photo-warning{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.72)}.photo-warning-box{width:min(420px,100%);background:var(--panel);border:1px solid var(--bad);border-radius:8px;padding:20px;box-shadow:0 18px 60px rgba(0,0,0,.5)}.photo-warning-box strong{display:block;color:#ffd0d0;font-size:18px;line-height:1.25}.photo-warning-box p{color:var(--muted);margin:10px 0 18px}[hidden]{display:none!important}.cropper{display:grid;gap:12px;justify-items:start}.crop-canvas{width:min(320px,100%);height:auto;border:1px solid var(--line);border-radius:8px;background:#050505}.employee-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end;margin:0 0 14px}.employee-filters label{margin:0}.bulk-actions{display:grid;grid-template-columns:minmax(180px,280px) auto auto;gap:12px;align-items:end;margin:0 0 14px}.bulk-actions label{margin:0}.assignment-form select{min-width:150px;margin:0;padding:8px 10px}.labor-upload{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:end;margin-bottom:28px}.labor-upload label{margin:0}.report-head{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;align-items:start;margin-bottom:28px}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.metric span,.metric em{display:block;color:var(--muted);font-style:normal}.metric strong{display:block;font-size:28px;line-height:1.1;margin:8px 0}.section-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}.section-head.compact{align-items:center}.section-head h2{margin:0}.section-head p{margin:4px 0 0}.assignment-status{display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--muted);font-size:14px}.assignment-status span{border:1px solid var(--line);border-radius:6px;padding:5px 8px}.assignment-status strong{color:var(--text);font-size:15px}.labor-controls{display:grid;grid-template-columns:minmax(180px,1fr) minmax(160px,1fr) minmax(210px,1.2fr);gap:12px;align-items:end;flex:1;max-width:760px}.labor-controls label{margin:0}.calendar-head{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin:18px 0}.calendar-head h2{text-align:center;margin:0}.goal-form{display:grid;grid-template-columns:minmax(180px,280px) auto;gap:12px;align-items:end;margin:0 0 18px}.goal-form label{margin:0}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}.calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:700;text-align:center}.calendar-day{display:flex;min-height:112px;border:1px solid var(--line);border-radius:6px;background:#050505;padding:10px;text-decoration:none;flex-direction:column;justify-content:space-between}.calendar-day span{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:999px;font-weight:800}.calendar-day small{color:var(--muted);font-size:12px;line-height:1.2}.calendar-day.outside{color:#666;background:#080808}.calendar-day.outside small{visibility:hidden}.calendar-day.complete{border-color:#166534;background:#07130a}.calendar-day.missing-sales{border-color:#7f1d1d;background:#170808}.calendar-day.today span{background:var(--accent);color:white}.calendar-day.sunday.complete small{color:#9fd3aa}.calendar-day.locked{cursor:not-allowed;color:#777;background:#0a0a0a}.calendar-day.locked small{color:#666}.productivity-chart-wrap{width:100%;overflow-x:auto}.productivity-chart{display:block;width:100%;height:430px;min-width:720px;border:1px solid var(--line);border-radius:8px;background:#111}section+section{margin-top:28px}table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{color:var(--muted);font-weight:600}tr[hidden]{display:none}code,pre{background:#030303;border:1px solid var(--line);border-radius:6px}code{padding:2px 5px}pre{padding:16px;overflow:auto;white-space:pre-wrap}.notice code,.missing-date-link{display:inline-block;margin:6px 6px 0 0;padding:6px 8px;overflow:auto;background:#030303;border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,monospace;font-size:.9em;text-decoration:none}.missing-date-link:hover{border-color:var(--accent);color:white}
 @media (max-width:760px){header{height:auto;align-items:flex-start;gap:12px;padding:14px;flex-direction:column}nav{flex-wrap:wrap}.row,.split,.overview-grid,.profile-grid,.inline,.employee-filters,.bulk-actions,.labor-upload,.report-head,.summary-grid,.section-head,.labor-controls,.upload-grid,.goal-form{display:block}.row>*{margin-bottom:12px}.overview-grid .metric,.profile-grid .panel,.employee-filters label,.bulk-actions label,.bulk-actions button,.bulk-actions .button,.labor-upload label,.summary-grid .metric,.labor-controls label,.goal-form label{margin-bottom:12px}.upload-grid>div+div{margin-top:18px}.calendar-head{grid-template-columns:1fr 1fr}.calendar-head h2{grid-column:1/-1;grid-row:1;text-align:left}.calendar-head .button{grid-row:2}.calendar-grid{gap:5px}.calendar-day{min-height:72px;padding:6px}.calendar-day span{width:24px;height:24px}.calendar-day small{font-size:10px}main{padding:24px 14px}table{font-size:14px}th,td{padding:9px}}
 `

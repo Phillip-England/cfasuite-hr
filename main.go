@@ -617,6 +617,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /assets/app.css", css)
 	mux.HandleFunc("GET /forms/time-punch/{token}", a.publicTimePunchCorrectionForm)
 	mux.HandleFunc("POST /forms/time-punch/{token}", a.publicTimePunchCorrectionSubmit)
+	mux.HandleFunc("GET /forms/profile-photo/{token}", a.publicEmployeePhotoForm)
+	mux.HandleFunc("POST /forms/profile-photo/{token}", a.publicEmployeePhotoSubmit)
 	mux.HandleFunc("GET /api/v1/locations", a.apiAuth(a.apiLocations))
 	mux.HandleFunc("GET /api/v1/locations/{number}/employees", a.apiAuth(a.apiEmployees))
 	mux.HandleFunc("GET /api/v1/locations/{number}/employees/{employeeNumber}", a.apiAuth(a.apiEmployee))
@@ -789,10 +791,11 @@ func (a *App) employeeProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.render(w, employee.EmployeeName, employeeProfileHTML, map[string]any{
-		"Location": loc,
-		"Employee": employee,
-		"Updated":  r.URL.Query().Get("updated"),
-		"Flagged":  r.URL.Query().Get("flagged"),
+		"Location":         loc,
+		"Employee":         employee,
+		"ProfilePhotoLink": a.publicEmployeePhotoURL(r, loc, employee),
+		"Updated":          r.URL.Query().Get("updated"),
+		"Flagged":          r.URL.Query().Get("flagged"),
 	})
 }
 
@@ -887,6 +890,60 @@ func (a *App) employeePhotoFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/locations/%d/employees/%d?flagged=1", locationID, id), http.StatusSeeOther)
+}
+
+func (a *App) publicEmployeePhotoForm(w http.ResponseWriter, r *http.Request) {
+	loc, employee, ok := a.employeeFromPhotoToken(r.PathValue("token"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	a.render(w, "Profile Photo", publicEmployeePhotoHTML, map[string]any{
+		"LoggedOut": true,
+		"Location":  loc,
+		"Employee":  employee,
+		"Submitted": employee.ProfilePhotoDataURL != "",
+	})
+}
+
+func (a *App) publicEmployeePhotoSubmit(w http.ResponseWriter, r *http.Request) {
+	loc, employee, ok := a.employeeFromPhotoToken(r.PathValue("token"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	data := map[string]any{
+		"LoggedOut": true,
+		"Location":  loc,
+		"Employee":  employee,
+	}
+	if employee.ProfilePhotoDataURL != "" {
+		data["Submitted"] = true
+		a.render(w, "Profile Photo", publicEmployeePhotoHTML, data)
+		return
+	}
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		data["Error"] = err.Error()
+		a.render(w, "Profile Photo", publicEmployeePhotoHTML, data)
+		return
+	}
+	photo := strings.TrimSpace(r.FormValue("profile_photo_data_url"))
+	if err := validateProfilePhotoDataURL(photo); err != nil {
+		data["Error"] = err.Error()
+		a.render(w, "Profile Photo", publicEmployeePhotoHTML, data)
+		return
+	}
+	photoURL, err := saveEmployeeProfilePhoto(a.dataDir, loc, employee, photo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := updateEmployeeProfilePhoto(a.db, loc.ID, employee.ID, photoURL); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data["Submitted"] = true
+	a.render(w, "Profile Photo", publicEmployeePhotoHTML, data)
 }
 
 func (a *App) locationCalendar(w http.ResponseWriter, r *http.Request) {
@@ -1183,9 +1240,12 @@ func (a *App) publicTimePunchCorrectionForm(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, map[string]any{
-		"LoggedOut": true,
-		"Location":  loc,
-		"Today":     time.Now().Format("2006-01-02"),
+		"LoggedOut":          true,
+		"ShowLanguageToggle": true,
+		"Location":           loc,
+		"Today":              time.Now().Format("2006-01-02"),
+		"Step":               "pin",
+		"Form":               TimePunchCorrection{},
 	})
 }
 
@@ -1208,13 +1268,19 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 		Notes:        strings.TrimSpace(r.FormValue("notes")),
 	}
 	data := map[string]any{
-		"LoggedOut": true,
-		"Location":  loc,
-		"Today":     time.Now().Format("2006-01-02"),
-		"Form":      input,
+		"LoggedOut":          true,
+		"ShowLanguageToggle": true,
+		"Location":           loc,
+		"Today":              time.Now().Format("2006-01-02"),
+		"Form":               input,
 	}
-	if err := validateTimePunchCorrectionInput(input); err != nil {
-		data["Error"] = err.Error()
+	step := strings.TrimSpace(r.FormValue("step"))
+	if step == "" {
+		step = "lookup"
+	}
+	data["Step"] = "pin"
+	if input.ClockInPIN == "" {
+		data["Error"] = "clock-in PIN is required"
 		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
 		return
 	}
@@ -1228,12 +1294,33 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	photo := strings.TrimSpace(r.FormValue("profile_photo_data_url"))
-	if employeeNeedsProfilePhoto(employee) {
+	data["EmployeeName"] = employee.EmployeeName
+
+	switch step {
+	case "lookup":
+		if employeeNeedsProfilePhoto(employee) {
+			data["Step"] = "photo"
+			data["PhotoRequired"] = true
+			data["PhotoNeedsUpdate"] = employee.ProfilePhotoNeedsUpdate && employee.ProfilePhotoDataURL != ""
+		} else {
+			data["Step"] = "correction"
+		}
+		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+		return
+	case "photo":
 		data["EmployeeName"] = employee.EmployeeName
+		data["Step"] = "photo"
 		data["PhotoRequired"] = true
 		data["PhotoNeedsUpdate"] = employee.ProfilePhotoNeedsUpdate && employee.ProfilePhotoDataURL != ""
+		photo := strings.TrimSpace(r.FormValue("profile_photo_data_url"))
+		if !employeeNeedsProfilePhoto(employee) {
+			data["Step"] = "correction"
+			data["PhotoRequired"] = false
+			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+			return
+		}
 		if photo == "" {
+			data["Error"] = "profile photo is required"
 			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
 			return
 		}
@@ -1251,6 +1338,27 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		data["Step"] = "correction"
+		data["PhotoRequired"] = false
+		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+		return
+	case "correction":
+		if employeeNeedsProfilePhoto(employee) {
+			data["Step"] = "photo"
+			data["PhotoRequired"] = true
+			data["PhotoNeedsUpdate"] = employee.ProfilePhotoNeedsUpdate && employee.ProfilePhotoDataURL != ""
+			a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+			return
+		}
+	default:
+		http.Error(w, "invalid time punch correction step", http.StatusBadRequest)
+		return
+	}
+	if err := validateTimePunchCorrectionInput(input); err != nil {
+		data["Step"] = "correction"
+		data["Error"] = err.Error()
+		a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
+		return
 	}
 	input.EmployeeID = employee.ID
 	if err := createTimePunchCorrection(a.db, input); err != nil {
@@ -1260,6 +1368,7 @@ func (a *App) publicTimePunchCorrectionSubmit(w http.ResponseWriter, r *http.Req
 	data["Submitted"] = true
 	data["EmployeeName"] = employee.EmployeeName
 	data["Form"] = TimePunchCorrection{}
+	data["Step"] = "pin"
 	a.render(w, "Time Punch Correction", publicTimePunchCorrectionHTML, data)
 }
 
@@ -2446,6 +2555,48 @@ func scanEmployee(row scanner) (Employee, error) {
 
 func employeeNeedsProfilePhoto(employee Employee) bool {
 	return employee.ProfilePhotoDataURL == "" || employee.ProfilePhotoNeedsUpdate
+}
+
+func (a *App) publicEmployeePhotoURL(r *http.Request, loc Location, employee Employee) string {
+	return absoluteBaseURL(r) + "/forms/profile-photo/" + a.employeePhotoToken(loc, employee)
+}
+
+func (a *App) employeePhotoToken(loc Location, employee Employee) string {
+	payload := fmt.Sprintf("employee-photo|%d|%d", loc.ID, employee.ID)
+	sig := sign(a.sessionSecret, payload)
+	return base64.RawURLEncoding.EncodeToString([]byte(payload + "|" + sig))
+}
+
+func (a *App) employeeFromPhotoToken(raw string) (Location, Employee, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return Location{}, Employee{}, false
+	}
+	parts := strings.Split(string(decoded), "|")
+	if len(parts) != 4 || parts[0] != "employee-photo" {
+		return Location{}, Employee{}, false
+	}
+	payload := strings.Join(parts[:3], "|")
+	if !subtleEqual(sign(a.sessionSecret, payload), parts[3]) {
+		return Location{}, Employee{}, false
+	}
+	locationID, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return Location{}, Employee{}, false
+	}
+	employeeID, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return Location{}, Employee{}, false
+	}
+	loc, err := getLocation(a.db, locationID)
+	if err != nil {
+		return Location{}, Employee{}, false
+	}
+	employee, err := getEmployeeByID(a.db, locationID, employeeID)
+	if err != nil {
+		return Location{}, Employee{}, false
+	}
+	return loc, employee, true
 }
 
 func updateEmployeeProfilePhoto(db *sql.DB, locationID, id int64, dataURL string) error {
@@ -5393,7 +5544,10 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
       <a class="brand" href="/">cfasuite-hr</a>
       {{with .Location}}<span class="location-context">Store {{.Number}}</span>{{end}}
     </div>
-    {{if not .LoggedOut}}<nav>
+    {{if .ShowLanguageToggle}}<nav class="language-toggle" aria-label="Language">
+      <button type="button" class="small secondary active" data-lang-button="en">English</button>
+      <button type="button" class="small secondary" data-lang-button="es">Spanish</button>
+    </nav>{{else if not .LoggedOut}}<nav>
       <a href="/">Locations</a>
       <a href="/tokens">API Tokens</a>
       <a href="/docs">API Docs</a>
@@ -6194,6 +6348,11 @@ const employeeProfileHTML = `{{define "body"}}
       <div class="avatar large placeholder">{{slice .Employee.EmployeeName 0 1}}</div>
     {{end}}
     {{if .Employee.ProfilePhotoNeedsUpdate}}<p class="notice bad">Photo flagged for update.</p>{{end}}
+    {{if not .Employee.ProfilePhotoDataURL}}
+      <label>Employee upload link
+        <input readonly value="{{.ProfilePhotoLink}}" onclick="this.select()">
+      </label>
+    {{end}}
     <form method="post" action="/locations/{{.Location.ID}}/employees/{{.Employee.ID}}/photo/flag">
       <button class="secondary" {{if not .Employee.ProfilePhotoDataURL}}disabled{{end}}>Flag photo for update</button>
     </form>
@@ -6220,6 +6379,34 @@ const employeeProfileHTML = `{{define "body"}}
     <p><strong>Start date:</strong> {{.Employee.LocationLatestStartDate}}</p>
     <p><strong>Clock-in PIN:</strong> {{if .Employee.ClockInPIN}}{{.Employee.ClockInPIN}}{{else}}<span class="muted">Not imported</span>{{end}}</p>
   </div>
+</section>
+` + photoCropperScript + `
+{{end}}`
+
+const publicEmployeePhotoHTML = `{{define "body"}}
+<section class="narrow">
+  <div class="public-page-head">
+    <div>
+      <h1>Profile Photo</h1>
+      <p class="muted">{{.Employee.EmployeeName}} | Store {{.Location.Number}}</p>
+    </div>
+  </div>
+  {{if .Submitted}}
+    <p class="notice">Your profile photo was uploaded.</p>
+  {{else}}
+    {{if .Error}}<p class="notice bad">{{.Error}}</p>{{end}}
+    <form method="post" class="panel photo-crop-form" enctype="multipart/form-data">
+      <label>Profile photo
+        <input class="photo-input" type="file" accept="image/*" capture="user" required>
+      </label>
+      <div class="cropper" hidden>
+        <canvas class="crop-canvas" width="320" height="320"></canvas>
+        <label>Zoom <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
+      </div>
+      <input class="photo-data-input" type="hidden" name="profile_photo_data_url" required>
+      <button>Upload photo</button>
+    </form>
+  {{end}}
 </section>
 ` + photoCropperScript + `
 {{end}}`
@@ -6263,10 +6450,6 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       <h1 data-i18n="title">Time Punch Correction</h1>
       <p class="muted">{{.Location.Name}} | <span data-i18n="store">Store</span> {{.Location.Number}}</p>
     </div>
-    <nav class="language-toggle" aria-label="Language">
-      <button type="button" class="small secondary active" data-lang-button="en">English</button>
-      <button type="button" class="small secondary" data-lang-button="es">Espanol</button>
-    </nav>
   </div>
   {{if .Submitted}}<p class="notice"><span data-i18n="submitted">Your correction was submitted for</span> {{.EmployeeName}}.</p>{{end}}
   {{if .Error}}<p class="notice bad">{{.Error}}</p>{{end}}
@@ -6280,22 +6463,19 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       {{end}}
     </section>
   {{end}}
-  {{if .PhotoRequired}}
-    <section class="photo-warning" role="alert" aria-live="assertive" data-photo-warning>
-      <div class="photo-warning-box">
-        <strong data-i18n="{{if .PhotoNeedsUpdate}}photoUpdateTitle{{else}}photoRequiredTitle{{end}}">{{if .PhotoNeedsUpdate}}Please update your profile photo before continuing.{{else}}We need a profile picture for you before continuing.{{end}}</strong>
-        <p data-i18n="photoRequiredBody">This photo helps the store confirm who submitted the correction.</p>
-        <button type="button" data-photo-prompt-button data-i18n="choosePhoto">Choose profile photo</button>
-      </div>
-    </section>
-  {{end}}
-  <form method="post" class="panel photo-crop-form time-punch-form" enctype="multipart/form-data">
-    <label><span data-i18n="clockPin">Clock-in PIN</span> <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" autocomplete="one-time-code" required></label>
-    <label><span data-i18n="date">Date</span> <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
-    <label><span data-i18n="shiftStart">Shift start</span> <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
-    <label><span data-i18n="shiftEnd">Shift end</span> <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
-    <label><span data-i18n="notes">Notes</span> <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
-    {{if .PhotoRequired}}
+  {{if eq .Step "pin"}}
+    <form method="post" class="panel time-punch-form" enctype="multipart/form-data">
+      <input type="hidden" name="step" value="lookup">
+      <label><span data-i18n="clockPin">Clock-in PIN</span> <input name="clock_in_pin" inputmode="numeric" value="{{.Form.ClockInPIN}}" autocomplete="one-time-code" required autofocus></label>
+      <button data-i18n="continue">Continue</button>
+    </form>
+  {{else if eq .Step "photo"}}
+    <form method="post" class="panel photo-crop-form time-punch-form" enctype="multipart/form-data">
+      <input type="hidden" name="step" value="photo">
+      <input type="hidden" name="clock_in_pin" value="{{.Form.ClockInPIN}}">
+      <p class="muted"><span data-i18n="employee">Employee</span>: {{.EmployeeName}}</p>
+      <strong data-i18n="{{if .PhotoNeedsUpdate}}photoUpdateTitle{{else}}photoRequiredTitle{{end}}">{{if .PhotoNeedsUpdate}}Please update your profile photo before continuing.{{else}}We need a profile picture for you before continuing.{{end}}</strong>
+      <p class="muted" data-i18n="photoRequiredBody">This photo helps the store confirm who submitted the correction.</p>
       <label><span data-i18n="profilePhoto">Profile photo</span>
         <input class="photo-input" type="file" accept="image/*" capture="user" required>
       </label>
@@ -6304,9 +6484,20 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
         <label><span data-i18n="zoom">Zoom</span> <input class="zoom-input" type="range" min="1" max="3" step="0.01" value="1"></label>
       </div>
       <input class="photo-data-input" type="hidden" name="profile_photo_data_url" required>
-    {{end}}
-    <button data-i18n="submit">Submit correction</button>
-  </form>
+      <button data-i18n="savePhoto">Save photo</button>
+    </form>
+  {{else if eq .Step "correction"}}
+    <form method="post" class="panel time-punch-form" enctype="multipart/form-data">
+      <input type="hidden" name="step" value="correction">
+      <input type="hidden" name="clock_in_pin" value="{{.Form.ClockInPIN}}">
+      <p class="muted"><span data-i18n="employee">Employee</span>: {{.EmployeeName}}</p>
+      <label><span data-i18n="date">Date</span> <input type="date" name="business_date" value="{{if .Form.BusinessDate}}{{.Form.BusinessDate}}{{else}}{{.Today}}{{end}}" required></label>
+      <label><span data-i18n="shiftStart">Shift start</span> <input type="time" name="start_time" value="{{.Form.StartTime}}" required></label>
+      <label><span data-i18n="shiftEnd">Shift end</span> <input type="time" name="end_time" value="{{.Form.EndTime}}" required></label>
+      <label><span data-i18n="notes">Notes</span> <textarea name="notes" rows="4">{{.Form.Notes}}</textarea></label>
+      <button data-i18n="submit">Submit correction</button>
+    </form>
+  {{end}}
 </section>
 {{if .PhotoRequired}}` + photoCropperScript + `{{end}}
 <script>
@@ -6326,6 +6517,7 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       photoUpdateTitle: 'Please update your profile photo before continuing.',
       photoRequiredBody: 'This photo helps the store confirm who submitted the correction.',
       choosePhoto: 'Choose profile photo',
+      employee: 'Employee',
       clockPin: 'Clock-in PIN',
       date: 'Date',
       shiftStart: 'Shift start',
@@ -6333,6 +6525,8 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       notes: 'Notes',
       profilePhoto: 'Profile photo',
       zoom: 'Zoom',
+      'continue': 'Continue',
+      savePhoto: 'Save photo',
       submit: 'Submit correction'
     },
     es: {
@@ -6347,6 +6541,7 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       photoUpdateTitle: 'Actualice su foto de perfil antes de continuar.',
       photoRequiredBody: 'Esta foto ayuda a la tienda a confirmar quien envio la correccion.',
       choosePhoto: 'Elegir foto de perfil',
+      employee: 'Empleado',
       clockPin: 'PIN de reloj',
       date: 'Fecha',
       shiftStart: 'Inicio del turno',
@@ -6354,6 +6549,8 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       notes: 'Notas',
       profilePhoto: 'Foto de perfil',
       zoom: 'Zoom',
+      'continue': 'Continuar',
+      savePhoto: 'Guardar foto',
       submit: 'Enviar correccion'
     }
   };
@@ -6363,13 +6560,13 @@ const publicTimePunchCorrectionHTML = `{{define "body"}}
       const key = node.dataset.i18n;
       if (copy[key]) node.textContent = copy[key];
     });
-    page.querySelectorAll('[data-lang-button]').forEach(button => {
+    document.querySelectorAll('[data-lang-button]').forEach(button => {
       button.classList.toggle('active', button.dataset.langButton === lang);
     });
     document.documentElement.lang = lang;
     try { localStorage.setItem('timePunchLanguage', lang); } catch (_) {}
   }
-  page.querySelectorAll('[data-lang-button]').forEach(button => {
+  document.querySelectorAll('[data-lang-button]').forEach(button => {
     button.addEventListener('click', () => setLanguage(button.dataset.langButton));
   });
   let preferred = 'en';

@@ -225,8 +225,75 @@ func TestEmployeeProfileRenders(t *testing.T) {
 		t.Fatalf("employeeProfile status = %d, body: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Upload profile photo") || !strings.Contains(body, "Blanco, John") {
+	if !strings.Contains(body, "Upload profile photo") || !strings.Contains(body, "Blanco, John") || !strings.Contains(body, "/forms/profile-photo/") {
 		t.Fatalf("employee profile did not render expected content: %s", body)
+	}
+}
+
+func TestPublicEmployeePhotoLinkUploadsProfilePhoto(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
+		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
+	if err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	employeeID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	loc, err := getLocation(db, locationID)
+	if err != nil {
+		t.Fatalf("getLocation: %v", err)
+	}
+	employee, err := getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID: %v", err)
+	}
+	app := &App{db: db, dataDir: t.TempDir(), sessionSecret: []byte("test-secret")}
+	token := app.employeePhotoToken(loc, employee)
+
+	req := httptest.NewRequest("GET", "/forms/profile-photo/"+token, nil)
+	req.SetPathValue("token", token)
+	rec := httptest.NewRecorder()
+	app.publicEmployeePhotoForm(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Profile photo") || !strings.Contains(rec.Body.String(), "Blanco, John") {
+		t.Fatalf("public photo form did not render, status = %d body: %s", rec.Code, rec.Body.String())
+	}
+
+	var reqBody bytes.Buffer
+	writer := multipart.NewWriter(&reqBody)
+	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
+	if err := writer.WriteField("profile_photo_data_url", photo); err != nil {
+		t.Fatalf("write multipart field: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req = httptest.NewRequest("POST", "/forms/profile-photo/"+token, &reqBody)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.SetPathValue("token", token)
+	rec = httptest.NewRecorder()
+	app.publicEmployeePhotoSubmit(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Your profile photo was uploaded.") {
+		t.Fatalf("public photo submit did not render success, status = %d body: %s", rec.Code, rec.Body.String())
+	}
+	employee, err = getEmployeeByID(db, locationID, employeeID)
+	if err != nil {
+		t.Fatalf("getEmployeeByID after upload: %v", err)
+	}
+	if employee.ProfilePhotoDataURL == "" || employee.ProfilePhotoNeedsUpdate {
+		t.Fatalf("public upload did not update employee photo state: %#v", employee)
 	}
 }
 
@@ -893,6 +960,112 @@ func TestUnknownClockInPINDoesNotCreateCorrection(t *testing.T) {
 	}
 	if len(corrections) != 0 {
 		t.Fatalf("missing PIN should not create corrections: %#v", corrections)
+	}
+}
+
+func TestPublicTimePunchCorrectionLookupMissingPINShowsEmailFallback(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	loc, err := getLocation(db, locationID)
+	if err != nil {
+		t.Fatalf("getLocation: %v", err)
+	}
+	app := &App{db: db, dataDir: t.TempDir()}
+	form := url.Values{"step": {"lookup"}, "clock_in_pin": {"404404"}}
+	var reqBody bytes.Buffer
+	writer := multipart.NewWriter(&reqBody)
+	for key, values := range form {
+		for _, value := range values {
+			if err := writer.WriteField(key, value); err != nil {
+				t.Fatalf("write multipart field: %v", err)
+			}
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/forms/time-punch/"+loc.TimePunchToken, &reqBody)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.SetPathValue("token", loc.TimePunchToken)
+	rec := httptest.NewRecorder()
+	app.publicTimePunchCorrectionSubmit(rec, req)
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, "Email your time punch correction to") || strings.Contains(body, `name="business_date"`) {
+		t.Fatalf("missing PIN should show email fallback without correction fields, status = %d body: %s", rec.Code, body)
+	}
+}
+
+func TestPublicTimePunchCorrectionLookupRoutesByProfilePhoto(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	loc, err := getLocation(db, locationID)
+	if err != nil {
+		t.Fatalf("getLocation: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin, profile_photo_data_url)
+		VALUES (?, 'Blanco, John', '12-1083836', 'Team Member', 'Active', '2026-01-01', '99129', 'data:image/jpeg;base64,cGhvdG8=')`, locationID)
+	if err != nil {
+		t.Fatalf("insert employee with photo: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin)
+		VALUES (?, 'Rivera, Maria', '12-1083837', 'Team Member', 'Active', '2026-01-01', '55129')`, locationID)
+	if err != nil {
+		t.Fatalf("insert employee without photo: %v", err)
+	}
+	app := &App{db: db, dataDir: t.TempDir()}
+	postLookup := func(form url.Values) *httptest.ResponseRecorder {
+		var reqBody bytes.Buffer
+		writer := multipart.NewWriter(&reqBody)
+		for key, values := range form {
+			for _, value := range values {
+				if err := writer.WriteField(key, value); err != nil {
+					t.Fatalf("write multipart field: %v", err)
+				}
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close multipart writer: %v", err)
+		}
+		req := httptest.NewRequest("POST", "/forms/time-punch/"+loc.TimePunchToken, &reqBody)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.SetPathValue("token", loc.TimePunchToken)
+		rec := httptest.NewRecorder()
+		app.publicTimePunchCorrectionSubmit(rec, req)
+		return rec
+	}
+
+	withPhoto := url.Values{"step": {"lookup"}, "clock_in_pin": {"99129"}}
+	rec := postLookup(withPhoto)
+	body := rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, `name="step" value="correction"`) || !strings.Contains(body, `name="business_date"`) {
+		t.Fatalf("employee with photo should route to correction step, status = %d body: %s", rec.Code, body)
+	}
+
+	withoutPhoto := url.Values{"step": {"lookup"}, "clock_in_pin": {"55129"}}
+	rec = postLookup(withoutPhoto)
+	body = rec.Body.String()
+	if rec.Code != 200 || !strings.Contains(body, `name="step" value="photo"`) || !strings.Contains(body, `name="profile_photo_data_url"`) || strings.Contains(body, `name="business_date"`) {
+		t.Fatalf("employee without photo should route to photo step only, status = %d body: %s", rec.Code, body)
 	}
 }
 
@@ -1646,11 +1819,23 @@ func TestAdminTemplatesRender(t *testing.T) {
 			name: "public time punch correction",
 			body: publicTimePunchCorrectionHTML,
 			data: map[string]any{
-				"Title":     "Time Punch Correction",
+				"Title":              "Time Punch Correction",
+				"LoggedOut":          true,
+				"ShowLanguageToggle": true,
+				"Location":           Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
+				"Today":              "2026-06-13",
+				"Step":               "pin",
+				"Form":               TimePunchCorrection{},
+			},
+		},
+		{
+			name: "public employee photo",
+			body: publicEmployeePhotoHTML,
+			data: map[string]any{
+				"Title":     "Profile Photo",
 				"LoggedOut": true,
 				"Location":  Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
-				"Today":     "2026-06-13",
-				"Form":      TimePunchCorrection{},
+				"Employee":  Employee{ID: 1, EmployeeName: "Blanco, John", EmployeeNumber: "12-1083836"},
 			},
 		},
 		{

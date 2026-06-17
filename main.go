@@ -282,7 +282,6 @@ func migrate(db *sql.DB) error {
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_time_punch_token ON locations(time_punch_token) WHERE time_punch_token <> ''`,
 		`CREATE TABLE IF NOT EXISTS roles (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
@@ -421,6 +420,9 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "locations", "time_punch_token", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_time_punch_token ON locations(time_punch_token) WHERE time_punch_token <> ''`); err != nil {
 		return err
 	}
 	if err := ensureLocationTimePunchTokens(db); err != nil {

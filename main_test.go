@@ -33,6 +33,46 @@ func TestParseBio(t *testing.T) {
 	}
 }
 
+func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE locations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		number TEXT NOT NULL UNIQUE,
+		email TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`)
+	if err != nil {
+		t.Fatalf("create old locations table: %v", err)
+	}
+	_, err = db.Exec(`INSERT INTO locations (name, number, email) VALUES (?, ?, ?)`, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("insert old location: %v", err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	var token string
+	if err := db.QueryRow(`SELECT time_punch_token FROM locations WHERE number = ?`, "03394").Scan(&token); err != nil {
+		t.Fatalf("select time_punch_token: %v", err)
+	}
+	if token == "" {
+		t.Fatal("expected migration to populate time_punch_token")
+	}
+	var indexCount int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_locations_time_punch_token'`).Scan(&indexCount); err != nil {
+		t.Fatalf("select index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("expected time punch token index to exist, got %d", indexCount)
+	}
+}
+
 func TestImportBioSyncsEmployees(t *testing.T) {
 	data, err := os.ReadFile("bio.xlsx")
 	if err != nil {

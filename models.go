@@ -40,14 +40,13 @@ type App struct {
 }
 
 type Location struct {
-	ID             int64     `json:"id"`
-	Name           string    `json:"name"`
-	Number         string    `json:"number"`
-	Email          string    `json:"email,omitempty"`
-	TimePunchToken string    `json:"-"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	Employees      int       `json:"employee_count,omitempty"`
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Number    string    `json:"number"`
+	Email     string    `json:"email,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Employees int       `json:"employee_count,omitempty"`
 }
 
 type Employee struct {
@@ -63,8 +62,6 @@ type Employee struct {
 	WageRateCents           *int64    `json:"wage_rate_cents"`
 	WagePayType             string    `json:"wage_pay_type"`
 	ExcludeFromLabor        bool      `json:"exclude_from_labor"`
-	ProfilePhotoDataURL     string    `json:"profile_photo_data_url,omitempty"`
-	ProfilePhotoNeedsUpdate bool      `json:"profile_photo_needs_update"`
 	EmployeeStatus          string    `json:"employee_status"`
 	LocationLatestStartDate string    `json:"location_latest_start_date"`
 	BirthDate               *string   `json:"birth_date"`
@@ -142,20 +139,6 @@ type BirthdayEmployee struct {
 type PinEmployee struct {
 	Name       string
 	ClockInPIN string
-}
-
-type TimePunchCorrection struct {
-	ID             int64
-	LocationID     int64
-	EmployeeID     int64
-	EmployeeName   string
-	EmployeeNumber string
-	ClockInPIN     string
-	BusinessDate   string
-	StartTime      string
-	EndTime        string
-	Notes          string
-	CreatedAt      time.Time
 }
 
 type DaypartSalesReport struct {

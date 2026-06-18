@@ -30,7 +30,7 @@ export CFASUITE_SESSION_SECRET=replace-with-a-long-random-value
 
 The app is designed around one SQLite database for the whole service. Do not add feature-specific database files. Store relational state in that database and add idempotent migrations as the schema grows.
 
-Profile photos are stored on disk under `CFASUITE_DATA_DIR` in per-location directories, for example `locations/03394/profile-pictures/employee-123.jpg`. Temporary files created for document parsing are stored under `CFASUITE_DATA_DIR/tmp`.
+Temporary files created for document parsing are stored under `CFASUITE_DATA_DIR/tmp`.
 
 Admin credentials can also be stored in SQLite:
 

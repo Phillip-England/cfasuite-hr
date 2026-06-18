@@ -20,7 +20,7 @@ The application has one runtime system of record:
 - Do not introduce per-feature database files, local JSON stores, hidden caches, or secondary persistence engines. If a feature needs state, add an idempotent migration and keep the storage helper in the owning module.
 - `*sql.DB` is created once at startup and passed through `App`. HTTP handlers, CLI commands, and import/sync functions should receive that database handle explicitly.
 - Filesystem writes are allowed only under `CFASUITE_DATA_DIR`, except the SQLite file itself when `CFASUITE_DB_PATH` deliberately points somewhere else.
-- Current filesystem-owned paths are `locations/{storeNumber}/profile-pictures/` for profile photos and `tmp/` for transient parser files.
+- The filesystem-owned `tmp/` path holds transient parser files.
 - Uploaded source documents are parsed and discarded. Do not persist raw uploads unless the feature explicitly needs audit storage and the path is documented here first.
 
 Environment variables are the boundary between deployment and code. New configurable paths must be rooted under `CFASUITE_DATA_DIR`; new service configuration should use `CFASUITE_`-prefixed variables and be documented in `README.md`.

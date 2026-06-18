@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"html/template"
 	"mime/multipart"
@@ -193,156 +192,26 @@ func TestSalesChartPointsUseBenchmarkAverage(t *testing.T) {
 	}
 }
 
-func TestMigrateAddsTimePunchTokenToExistingLocations(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
+func TestMigrateExcludesRemovedFeatures(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
 	defer db.Close()
-	_, err = db.Exec(`CREATE TABLE locations (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL,
-		number TEXT NOT NULL UNIQUE,
-		email TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`)
-	if err != nil {
-		t.Fatalf("create old locations table: %v", err)
-	}
-	_, err = db.Exec(`INSERT INTO locations (name, number, email) VALUES (?, ?, ?)`, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("insert old location: %v", err)
-	}
 	if err := migrate(db); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	var token string
-	if err := db.QueryRow(`SELECT time_punch_token FROM locations WHERE number = ?`, "03394").Scan(&token); err != nil {
-		t.Fatalf("select time_punch_token: %v", err)
-	}
-	if token == "" {
-		t.Fatal("expected migration to populate time_punch_token")
-	}
-	var indexCount int
-	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_locations_time_punch_token'`).Scan(&indexCount); err != nil {
-		t.Fatalf("select index: %v", err)
-	}
-	if indexCount != 1 {
-		t.Fatalf("expected time punch token index to exist, got %d", indexCount)
-	}
-}
 
-func TestEmployeeProfilePhotoColumnsAndUpdate(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
+	var removedObjects int
+	err = db.QueryRow(`SELECT
+		(SELECT count(*) FROM sqlite_master WHERE name = 'time_punch_corrections') +
+		(SELECT count(*) FROM pragma_table_info('locations') WHERE name = 'time_punch_token') +
+		(SELECT count(*) FROM pragma_table_info('employees') WHERE name IN ('profile_photo_data_url', 'profile_photo_needs_update'))`).Scan(&removedObjects)
 	if err != nil {
-		t.Fatalf("openDB: %v", err)
+		t.Fatalf("inspect schema: %v", err)
 	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
-		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
-	if err != nil {
-		t.Fatalf("insert employee: %v", err)
-	}
-	employeeID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("LastInsertId: %v", err)
-	}
-	employee, err := getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID: %v", err)
-	}
-	if !employeeNeedsProfilePhoto(employee) {
-		t.Fatal("new employee should need a profile photo")
-	}
-	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
-	if err := updateEmployeeProfilePhoto(db, locationID, employeeID, photo); err != nil {
-		t.Fatalf("updateEmployeeProfilePhoto: %v", err)
-	}
-	employee, err = getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID after photo update: %v", err)
-	}
-	if employee.ProfilePhotoDataURL != photo || employee.ProfilePhotoNeedsUpdate || employeeNeedsProfilePhoto(employee) {
-		t.Fatalf("photo update did not persist clean state: %#v", employee)
-	}
-	if err := flagEmployeeProfilePhoto(db, locationID, employeeID); err != nil {
-		t.Fatalf("flagEmployeeProfilePhoto: %v", err)
-	}
-	employee, err = getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID after flag: %v", err)
-	}
-	if !employee.ProfilePhotoNeedsUpdate || !employeeNeedsProfilePhoto(employee) {
-		t.Fatalf("flag did not require a new photo: %#v", employee)
-	}
-}
-
-func TestSaveEmployeeProfilePhotoWritesToLocationDirectory(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
-		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
-	if err != nil {
-		t.Fatalf("insert employee: %v", err)
-	}
-	employeeID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("LastInsertId: %v", err)
-	}
-	loc, err := getLocation(db, locationID)
-	if err != nil {
-		t.Fatalf("getLocation: %v", err)
-	}
-	employee, err := getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID: %v", err)
-	}
-	dataDir := t.TempDir()
-	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
-	photoURL, err := saveEmployeeProfilePhoto(dataDir, loc, employee, photo)
-	if err != nil {
-		t.Fatalf("saveEmployeeProfilePhoto: %v", err)
-	}
-	if !strings.HasPrefix(photoURL, "/locations/"+strconv.FormatInt(locationID, 10)+"/employees/"+strconv.FormatInt(employeeID, 10)+"/photo/image?v=") {
-		t.Fatalf("unexpected photo URL: %s", photoURL)
-	}
-	path := filepath.Join(dataDir, "locations", "03394", "profile-pictures", "employee-"+strconv.FormatInt(employeeID, 10)+".jpg")
-	written, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read saved photo: %v", err)
-	}
-	if string(written) != "photo" {
-		t.Fatalf("saved photo contents = %q", string(written))
-	}
-	if err := updateEmployeeProfilePhoto(db, locationID, employeeID, photoURL); err != nil {
-		t.Fatalf("updateEmployeeProfilePhoto: %v", err)
-	}
-	app := &App{db: db, dataDir: dataDir}
-	req := httptest.NewRequest("GET", photoURL, nil)
-	req.SetPathValue("locationID", strconv.FormatInt(locationID, 10))
-	req.SetPathValue("id", strconv.FormatInt(employeeID, 10))
-	rec := httptest.NewRecorder()
-	app.employeePhotoImage(rec, req)
-	if rec.Code != 200 || rec.Body.String() != "photo" {
-		t.Fatalf("employeePhotoImage status = %d body = %q", rec.Code, rec.Body.String())
+	if removedObjects != 0 {
+		t.Fatalf("fresh schema contains %d removed objects", removedObjects)
 	}
 }
 
@@ -381,75 +250,8 @@ func TestEmployeeProfileRenders(t *testing.T) {
 		t.Fatalf("employeeProfile status = %d, body: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Upload profile photo") || !strings.Contains(body, "Blanco, John") || !strings.Contains(body, "/forms/profile-photo/") {
+	if !strings.Contains(body, "Employee details") || !strings.Contains(body, "Blanco, John") {
 		t.Fatalf("employee profile did not render expected content: %s", body)
-	}
-}
-
-func TestPublicEmployeePhotoLinkUploadsProfilePhoto(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	res, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date)
-		VALUES (?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", "Active", "2024-10-01")
-	if err != nil {
-		t.Fatalf("insert employee: %v", err)
-	}
-	employeeID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("LastInsertId: %v", err)
-	}
-	loc, err := getLocation(db, locationID)
-	if err != nil {
-		t.Fatalf("getLocation: %v", err)
-	}
-	employee, err := getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID: %v", err)
-	}
-	app := &App{db: db, dataDir: t.TempDir(), sessionSecret: []byte("test-secret")}
-	token := app.employeePhotoToken(loc, employee)
-
-	req := httptest.NewRequest("GET", "/forms/profile-photo/"+token, nil)
-	req.SetPathValue("token", token)
-	rec := httptest.NewRecorder()
-	app.publicEmployeePhotoForm(rec, req)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Profile photo") || !strings.Contains(rec.Body.String(), "Blanco, John") {
-		t.Fatalf("public photo form did not render, status = %d body: %s", rec.Code, rec.Body.String())
-	}
-
-	var reqBody bytes.Buffer
-	writer := multipart.NewWriter(&reqBody)
-	photo := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("photo"))
-	if err := writer.WriteField("profile_photo_data_url", photo); err != nil {
-		t.Fatalf("write multipart field: %v", err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close multipart writer: %v", err)
-	}
-	req = httptest.NewRequest("POST", "/forms/profile-photo/"+token, &reqBody)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.SetPathValue("token", token)
-	rec = httptest.NewRecorder()
-	app.publicEmployeePhotoSubmit(rec, req)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Your profile photo was uploaded.") {
-		t.Fatalf("public photo submit did not render success, status = %d body: %s", rec.Code, rec.Body.String())
-	}
-	employee, err = getEmployeeByID(db, locationID, employeeID)
-	if err != nil {
-		t.Fatalf("getEmployeeByID after upload: %v", err)
-	}
-	if employee.ProfilePhotoDataURL == "" || employee.ProfilePhotoNeedsUpdate {
-		t.Fatalf("public upload did not update employee photo state: %#v", employee)
 	}
 }
 
@@ -1039,189 +841,6 @@ Kitchen Lead
 	}
 	if len(pins) != 1 || pins[0].Name != "Vasquez, Rafael" || pins[0].ClockInPIN != "123456" {
 		t.Fatalf("unexpected PIN rows: %#v", pins)
-	}
-}
-
-func TestTimePunchCorrectionUsesClockInPINForLocation(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin)
-		VALUES (?, 'Blanco, John', '12-1083836', 'Team Member', 'Active', '2026-01-01', '99129')`, locationID)
-	if err != nil {
-		t.Fatalf("insert employee: %v", err)
-	}
-	employee, err := getEmployeeByClockInPIN(db, locationID, "99129")
-	if err != nil {
-		t.Fatalf("getEmployeeByClockInPIN: %v", err)
-	}
-	if err := createTimePunchCorrection(db, TimePunchCorrection{
-		LocationID:   locationID,
-		EmployeeID:   employee.ID,
-		ClockInPIN:   "99129",
-		BusinessDate: "2026-06-13",
-		StartTime:    "08:00",
-		EndTime:      "15:30",
-		Notes:        "Forgot to clock in",
-	}); err != nil {
-		t.Fatalf("createTimePunchCorrection: %v", err)
-	}
-	corrections, err := listTimePunchCorrections(db, locationID)
-	if err != nil {
-		t.Fatalf("listTimePunchCorrections: %v", err)
-	}
-	if len(corrections) != 1 || corrections[0].EmployeeName != "Blanco, John" || corrections[0].StartTime != "08:00" {
-		t.Fatalf("unexpected corrections: %#v", corrections)
-	}
-	if err := deleteTimePunchCorrection(db, locationID, corrections[0].ID); err != nil {
-		t.Fatalf("deleteTimePunchCorrection: %v", err)
-	}
-	corrections, err = listTimePunchCorrections(db, locationID)
-	if err != nil {
-		t.Fatalf("listTimePunchCorrections after delete: %v", err)
-	}
-	if len(corrections) != 0 {
-		t.Fatalf("expected correction to be deleted, got %#v", corrections)
-	}
-}
-
-func TestUnknownClockInPINDoesNotCreateCorrection(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	if _, err := getEmployeeByClockInPIN(db, locationID, "00000"); err == nil {
-		t.Fatal("expected missing PIN to return an error")
-	}
-	corrections, err := listTimePunchCorrections(db, locationID)
-	if err != nil {
-		t.Fatalf("listTimePunchCorrections: %v", err)
-	}
-	if len(corrections) != 0 {
-		t.Fatalf("missing PIN should not create corrections: %#v", corrections)
-	}
-}
-
-func TestPublicTimePunchCorrectionLookupMissingPINShowsEmailFallback(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	loc, err := getLocation(db, locationID)
-	if err != nil {
-		t.Fatalf("getLocation: %v", err)
-	}
-	app := &App{db: db, dataDir: t.TempDir()}
-	form := url.Values{"step": {"lookup"}, "clock_in_pin": {"404404"}}
-	var reqBody bytes.Buffer
-	writer := multipart.NewWriter(&reqBody)
-	for key, values := range form {
-		for _, value := range values {
-			if err := writer.WriteField(key, value); err != nil {
-				t.Fatalf("write multipart field: %v", err)
-			}
-		}
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close multipart writer: %v", err)
-	}
-	req := httptest.NewRequest("POST", "/forms/time-punch/"+loc.TimePunchToken, &reqBody)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.SetPathValue("token", loc.TimePunchToken)
-	rec := httptest.NewRecorder()
-	app.publicTimePunchCorrectionSubmit(rec, req)
-	body := rec.Body.String()
-	if rec.Code != 200 || !strings.Contains(body, "Email your time punch correction to") || strings.Contains(body, `name="business_date"`) {
-		t.Fatalf("missing PIN should show email fallback without correction fields, status = %d body: %s", rec.Code, body)
-	}
-}
-
-func TestPublicTimePunchCorrectionLookupRoutesByProfilePhoto(t *testing.T) {
-	db, err := openDB(t.TempDir() + "/test.db")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	defer db.Close()
-	if err := migrate(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
-	if err != nil {
-		t.Fatalf("createLocation: %v", err)
-	}
-	loc, err := getLocation(db, locationID)
-	if err != nil {
-		t.Fatalf("getLocation: %v", err)
-	}
-	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin, profile_photo_data_url)
-		VALUES (?, 'Blanco, John', '12-1083836', 'Team Member', 'Active', '2026-01-01', '99129', 'data:image/jpeg;base64,cGhvdG8=')`, locationID)
-	if err != nil {
-		t.Fatalf("insert employee with photo: %v", err)
-	}
-	_, err = db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, employee_status, location_latest_start_date, clock_in_pin)
-		VALUES (?, 'Rivera, Maria', '12-1083837', 'Team Member', 'Active', '2026-01-01', '55129')`, locationID)
-	if err != nil {
-		t.Fatalf("insert employee without photo: %v", err)
-	}
-	app := &App{db: db, dataDir: t.TempDir()}
-	postLookup := func(form url.Values) *httptest.ResponseRecorder {
-		var reqBody bytes.Buffer
-		writer := multipart.NewWriter(&reqBody)
-		for key, values := range form {
-			for _, value := range values {
-				if err := writer.WriteField(key, value); err != nil {
-					t.Fatalf("write multipart field: %v", err)
-				}
-			}
-		}
-		if err := writer.Close(); err != nil {
-			t.Fatalf("close multipart writer: %v", err)
-		}
-		req := httptest.NewRequest("POST", "/forms/time-punch/"+loc.TimePunchToken, &reqBody)
-		req.Header.Set("Content-Type", writer.FormDataContentType())
-		req.SetPathValue("token", loc.TimePunchToken)
-		rec := httptest.NewRecorder()
-		app.publicTimePunchCorrectionSubmit(rec, req)
-		return rec
-	}
-
-	withPhoto := url.Values{"step": {"lookup"}, "clock_in_pin": {"99129"}}
-	rec := postLookup(withPhoto)
-	body := rec.Body.String()
-	if rec.Code != 200 || !strings.Contains(body, `name="step" value="correction"`) || !strings.Contains(body, `name="business_date"`) {
-		t.Fatalf("employee with photo should route to correction step, status = %d body: %s", rec.Code, body)
-	}
-
-	withoutPhoto := url.Values{"step": {"lookup"}, "clock_in_pin": {"55129"}}
-	rec = postLookup(withoutPhoto)
-	body = rec.Body.String()
-	if rec.Code != 200 || !strings.Contains(body, `name="step" value="photo"`) || !strings.Contains(body, `name="profile_photo_data_url"`) || strings.Contains(body, `name="business_date"`) {
-		t.Fatalf("employee without photo should route to photo step only, status = %d body: %s", rec.Code, body)
 	}
 }
 
@@ -2032,56 +1651,7 @@ func TestAdminTemplatesRender(t *testing.T) {
 				"Saved":    "1",
 			},
 		},
-		{
-			name: "location secret links",
-			body: locationSecretLinksHTML,
-			data: map[string]any{
-				"Title":         "Secret Links",
-				"Location":      Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
-				"TimePunchLink": "https://hr.example.com/forms/time-punch/secret",
-			},
-		},
-		{
-			name: "location time punch corrections",
-			body: locationTimePunchCorrectionsHTML,
-			data: map[string]any{
-				"Title":    "Time Punch Corrections",
-				"Location": Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
-				"Corrections": []TimePunchCorrection{{
-					ID:             1,
-					EmployeeName:   "Blanco, John",
-					EmployeeNumber: "12-1083836",
-					BusinessDate:   "2026-06-13",
-					StartTime:      "08:00",
-					EndTime:        "15:30",
-					Notes:          "Forgot to clock in",
-					CreatedAt:      time.Date(2026, time.June, 13, 16, 0, 0, 0, time.Local),
-				}},
-			},
-		},
-		{
-			name: "public time punch correction",
-			body: publicTimePunchCorrectionHTML,
-			data: map[string]any{
-				"Title":              "Time Punch Correction",
-				"LoggedOut":          true,
-				"ShowLanguageToggle": true,
-				"Location":           Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
-				"Today":              "2026-06-13",
-				"Step":               "pin",
-				"Form":               TimePunchCorrection{},
-			},
-		},
-		{
-			name: "public employee photo",
-			body: publicEmployeePhotoHTML,
-			data: map[string]any{
-				"Title":     "Profile Photo",
-				"LoggedOut": true,
-				"Location":  Location{ID: 1, Name: "Southroads", Number: "03394", Email: "southroads@example.com"},
-				"Employee":  Employee{ID: 1, EmployeeName: "Blanco, John", EmployeeNumber: "12-1083836"},
-			},
-		},
+
 		{
 			name: "roles",
 			body: rolesHTML,

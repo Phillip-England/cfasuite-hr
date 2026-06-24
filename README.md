@@ -54,6 +54,8 @@ cfasuite-hr serve
 cfasuite-hr token create -name "Reporting"
 cfasuite-hr token list
 cfasuite-hr token delete -id 1
+cfasuite-hr api-key-env -api-key cfa_... -base-url https://hr.example.com
+cfasuite-hr skill ./CFASUITE-HR.md
 cfasuite-hr api-context -base-url https://hr.example.com
 ```
 
@@ -117,6 +119,19 @@ Authorization: Bearer <token>
 X-API-Token: <token>
 ```
 
+For SDK clients, set:
+
+```sh
+export CFASUITE_HR_BASE_URL=https://hr.example.com
+export CFASUITE_HR_API_KEY=cfa_your_token
+```
+
+To print the shell exports:
+
+```sh
+cfasuite-hr api-key-env -api-key cfa_your_token -base-url https://hr.example.com
+```
+
 Endpoints:
 
 ```txt
@@ -146,13 +161,40 @@ curl -sS \
   "https://hr.example.com/api/v1/locations/03394/employees"
 ```
 
-To generate a complete copy/paste context block for a large language model or another developer, pass the public endpoint where the app is running:
+To generate a portable skill file for a large language model or another app, write:
+
+```sh
+cfasuite-hr skill ./CFASUITE-HR.md
+```
+
+The generated skill file documents the relative API endpoints, auth headers, data rules, and Go SDK usage without baking in a host.
+
+To generate the older complete copy/paste context block with absolute URLs, pass the public endpoint where the app is running:
 
 ```sh
 cfasuite-hr api-context -base-url https://hr.example.com
 ```
 
 The generated context includes exact URLs, auth headers, response shapes, birthday behavior, cURL examples, and a Go client example.
+
+## Go SDK
+
+The Go SDK lives at:
+
+```go
+import "github.com/phillip-england/cfasuite-hr/sdk"
+```
+
+Use environment configuration:
+
+```go
+client, err := sdk.NewClientFromEnv()
+locations, err := client.Locations(ctx)
+employees, err := client.Employees(ctx, "03394")
+employee, err := client.Employee(ctx, "03394", "12-1083836")
+```
+
+`NewClientFromEnv` requires `CFASUITE_HR_BASE_URL` and `CFASUITE_HR_API_KEY`; its error message tells callers how to set them when they are missing.
 
 ## Docker
 

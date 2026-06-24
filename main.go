@@ -55,6 +55,10 @@ func main() {
 		cmdAdminEnv(os.Args[2:])
 	case "token":
 		cmdToken(os.Args[2:])
+	case "api-key-env":
+		cmdAPIKeyEnv(os.Args[2:])
+	case "skill":
+		cmdSkill(os.Args[2:])
 	case "api-context":
 		cmdAPIContext(os.Args[2:])
 	case "-h", "--help", "help":
@@ -79,6 +83,8 @@ Usage:
   cfasuite-hr token create -name "Reporting" [-db path]
   cfasuite-hr token list [-db path]
   cfasuite-hr token delete -id 1 [-db path]
+  cfasuite-hr api-key-env -api-key cfa_... [-base-url https://hr.example.com]
+  cfasuite-hr skill [output.md]
   cfasuite-hr api-context -base-url https://hr.example.com
 
 Environment:
@@ -88,6 +94,8 @@ Environment:
   CFASUITE_ADMIN_USERNAME
   CFASUITE_ADMIN_PASSWORD
   CFASUITE_SESSION_SECRET
+  CFASUITE_HR_BASE_URL
+  CFASUITE_HR_API_KEY
 `, appName)
 }
 
@@ -238,6 +246,42 @@ func cmdToken(args []string) {
 		fmt.Fprintf(os.Stderr, "unknown token command: %s\n", args[0])
 		os.Exit(2)
 	}
+}
+
+func cmdAPIKeyEnv(args []string) {
+	fs := flag.NewFlagSet("api-key-env", flag.ExitOnError)
+	apiKey := fs.String("api-key", "", "cfasuite-hr API key")
+	baseURL := fs.String("base-url", "", "optional cfasuite-hr base URL")
+	fs.Parse(args)
+	if *apiKey == "" {
+		must(errors.New("api-key-env requires -api-key"))
+	}
+	fmt.Printf("export CFASUITE_HR_API_KEY=%q\n", *apiKey)
+	if strings.TrimSpace(*baseURL) != "" {
+		fmt.Printf("export CFASUITE_HR_BASE_URL=%q\n", strings.TrimRight(strings.TrimSpace(*baseURL), "/"))
+	}
+}
+
+func cmdSkill(args []string) {
+	fs := flag.NewFlagSet("skill", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "usage: cfasuite-hr skill [output.md]\n")
+	}
+	fs.Parse(args)
+	if fs.NArg() > 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	content := skillContext()
+	if fs.NArg() == 0 || fs.Arg(0) == "-" {
+		fmt.Print(content)
+		return
+	}
+	path := fs.Arg(0)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		must(err)
+	}
+	fmt.Printf("wrote %s\n", path)
 }
 
 func cmdAPIContext(args []string) {
@@ -4911,6 +4955,180 @@ func getSetting(db *sql.DB, key string) (string, error) {
 		return "", nil
 	}
 	return value, err
+}
+
+func skillContext() string {
+	return `# CFASUITE-HR Skill
+
+Use this context when an agent, app, or developer needs to read cfasuite-hr location and employee data.
+
+## What This Service Provides
+
+cfasuite-hr exposes Chick-fil-A restaurant locations and active employee records.
+Employee rows come from uploaded employee bio .xlsx files. Birthdays come from uploaded birthday report .xlsx files. Clock-in PINs come from uploaded PIN report PDFs.
+
+Jobs come from the employee bio import. Roles and departments are configured per location inside cfasuite-hr and assigned by an admin.
+
+## Authentication
+
+Every API request requires a valid cfasuite-hr API key.
+
+Send the key with either header:
+
+` + "```txt" + `
+Authorization: Bearer <api-key>
+X-API-Token: <api-key>
+` + "```" + `
+
+Create API keys in the admin UI at ` + "`/tokens`" + ` or with:
+
+` + "```sh" + `
+cfasuite-hr token create -name "Agent SDK"
+` + "```" + `
+
+Set SDK environment variables on a system with:
+
+` + "```sh" + `
+cfasuite-hr api-key-env -api-key cfa_your_token -base-url https://hr.example.com
+` + "```" + `
+
+Then evaluate or save the printed exports in the target shell. The SDK reads:
+
+- ` + "`CFASUITE_HR_API_KEY`" + `: required API key.
+- ` + "`CFASUITE_HR_BASE_URL`" + `: required service origin for SDK calls, for example ` + "`https://hr.example.com`" + `.
+
+## Go SDK
+
+Import the SDK package from this module:
+
+` + "```go" + `
+import "github.com/phillip-england/cfasuite-hr/sdk"
+` + "```" + `
+
+Create a client from environment variables:
+
+` + "```go" + `
+client, err := sdk.NewClientFromEnv()
+if err != nil {
+	return err // tells the caller which CFASUITE_HR_* variable is missing
+}
+` + "```" + `
+
+List locations:
+
+` + "```go" + `
+locations, err := client.Locations(ctx)
+` + "```" + `
+
+List active employees by store/location number:
+
+` + "```go" + `
+employees, err := client.Employees(ctx, "03394")
+` + "```" + `
+
+Get one employee by store/location number and employee number:
+
+` + "```go" + `
+employee, err := client.Employee(ctx, "03394", "12-1083836")
+` + "```" + `
+
+Store numbers and employee numbers are strings. Preserve leading zeroes and punctuation.
+
+## API Endpoints
+
+All endpoints below are relative to the cfasuite-hr service origin configured by the host application or ` + "`CFASUITE_HR_BASE_URL`" + `.
+
+### GET /api/v1/locations
+
+Returns all locations with store numbers and employee counts.
+
+Example response:
+
+` + "```json" + `
+{
+  "locations": [
+    {
+      "id": 1,
+      "name": "Southroads",
+      "number": "03394",
+      "email": "southroads@example.com",
+      "employee_count": 42,
+      "created_at": "2026-06-13T12:00:00Z",
+      "updated_at": "2026-06-13T12:00:00Z"
+    }
+  ]
+}
+` + "```" + `
+
+### GET /api/v1/locations/{storeNumber}/employees
+
+Returns active employees for one location.
+
+Example response:
+
+` + "```json" + `
+{
+  "location": {"id": 1, "name": "Southroads", "number": "03394"},
+  "employees": [
+    {
+      "id": 10,
+      "location_id": 1,
+      "employee_name": "Blanco, John",
+      "employee_number": "12-1083836",
+      "job": "Team Member",
+      "role_id": 2,
+      "role_name": "Trainer",
+      "department_id": 1,
+      "department_name": "Front of House",
+      "wage_rate_cents": 1500,
+      "wage_pay_type": "hourly",
+      "exclude_from_labor": false,
+      "employee_status": "Active",
+      "location_latest_start_date": "2024-10-01",
+      "birth_date": "1999-03-14",
+      "clock_in_pin": "99129",
+      "created_at": "2026-06-13T12:00:00Z",
+      "updated_at": "2026-06-13T12:00:00Z"
+    }
+  ]
+}
+` + "```" + `
+
+### GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}
+
+Returns one active employee by employee number at one location.
+
+## Data Rules
+
+- Store/location numbers are strings. Preserve leading zeroes such as ` + "`03394`" + `.
+- Employee numbers are strings.
+- Employees are active employees from the latest employee bio import.
+- ` + "`job`" + ` is imported from Chick-fil-A source data.
+- ` + "`role_id`" + `, ` + "`role_name`" + `, ` + "`department_id`" + `, and ` + "`department_name`" + ` are internal assignments and may be null.
+- ` + "`wage_rate_cents`" + ` and ` + "`wage_pay_type`" + ` come from uploaded time punch reports. ` + "`wage_pay_type`" + ` is ` + "`hourly`" + `, ` + "`salary`" + `, or empty when unknown.
+- ` + "`exclude_from_labor`" + ` means the employee is omitted from that location's labor calculations.
+- ` + "`birth_date`" + ` is ` + "`YYYY-MM-DD`" + ` when known and null when no birthday report matched the employee.
+- ` + "`clock_in_pin`" + ` is a string from the location PIN report, or null when no PIN has been imported.
+
+## Error Responses
+
+- ` + "`401 {\"error\":\"valid API token required\"}`" + ` when the key is missing or invalid.
+- ` + "`404 {\"error\":\"location not found\"}`" + ` when the store number does not exist.
+- ` + "`404 {\"error\":\"employee not found\"}`" + ` when the employee number does not exist at that store.
+
+## Direct HTTP Examples
+
+` + "```sh" + `
+curl -sS -H "Authorization: Bearer $CFASUITE_HR_API_KEY" \
+  "$CFASUITE_HR_BASE_URL/api/v1/locations"
+
+curl -sS -H "Authorization: Bearer $CFASUITE_HR_API_KEY" \
+  "$CFASUITE_HR_BASE_URL/api/v1/locations/03394/employees"
+
+curl -sS -H "Authorization: Bearer $CFASUITE_HR_API_KEY" \
+  "$CFASUITE_HR_BASE_URL/api/v1/locations/03394/employees/12-1083836"
+` + "```" + `
+`
 }
 
 func apiContext(baseURL string) string {

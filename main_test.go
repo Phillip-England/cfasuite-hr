@@ -56,6 +56,26 @@ func TestConfiguredDBPathKeepsLegacyDefault(t *testing.T) {
 	}
 }
 
+func TestSkillContextDocumentsSDKAndRelativeEndpoints(t *testing.T) {
+	context := skillContext()
+	for _, want := range []string{
+		"# CFASUITE-HR Skill",
+		"CFASUITE_HR_API_KEY",
+		"CFASUITE_HR_BASE_URL",
+		"sdk.NewClientFromEnv()",
+		"GET /api/v1/locations",
+		"GET /api/v1/locations/{storeNumber}/employees",
+		"GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}",
+	} {
+		if !strings.Contains(context, want) {
+			t.Fatalf("skillContext() missing %q", want)
+		}
+	}
+	if strings.Contains(context, "--host") {
+		t.Fatal("skillContext() should not document a --host flag")
+	}
+}
+
 func TestProductivityReportCombinesSalesLaborAndGoal(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/test.db")
 	if err != nil {

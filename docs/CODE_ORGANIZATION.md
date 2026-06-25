@@ -6,7 +6,16 @@
 
 The application is still one Go package, `main`, which is appropriate for this size. The package is now split at the file level:
 
-- `main.go`: executable entrypoint, CLI commands, HTTP routes and handlers, persistence functions, import logic, report logic, rendering, helpers, and embedded templates/CSS.
+- `main.go`: executable entrypoint, top-level command dispatch, location/employee/role/department handlers, import logic, sales/productivity/labor report logic, generated API context text, and remaining feature helpers.
+- `cli.go`: CLI command implementations and command-specific flag parsing.
+- `app.go`: application construction, route registration, rendering, JSON helpers, CSS serving, and app-wide HTTP helpers.
+- `auth.go`: browser admin auth, sessions, login attempt tracking, and shared auth crypto helpers.
+- `tokens.go`: API token admin handlers, token persistence helpers, token hashing, and API token middleware.
+- `api.go`: token-protected JSON API handlers.
+- `db.go`: database path selection, SQLite opening, migrations, schema helpers, and settings helpers.
+- `format.go`: shared date, money, hour, percentage, chart JSON, and parsing-format helpers.
+- `templates.go`: embedded HTML templates.
+- `assets.go`: embedded CSS.
 - `models.go`: application constants and shared domain types used across handlers, persistence, importers, and API responses.
 - `main_test.go`: behavior tests for imports, employee assignments, wages, labor parsing, API/auth helpers, and rendering-related helpers.
 
@@ -30,7 +39,7 @@ Environment variables are the boundary between deployment and code. New configur
 Use these file boundaries as the code grows:
 
 - `main.go`: `main`, `usage`, and top-level command dispatch only.
-- `cli.go`: CLI command implementations such as `serve`, `init`, `db`, `set-admin`, `token`, and `api-context`.
+- `cli.go`: CLI command implementations such as `serve`, `init`, `db`, `set-admin`, and `token`.
 - `app.go`: `App`, `newApp`, route registration, middleware wiring, rendering, and app-wide HTTP helpers.
 - `auth.go`: admin login/logout, session cookies, login attempt rate limiting, admin credential checks, and security helpers.
 - `tokens.go`: API token creation, listing, deletion, hashing, validation, and token admin handlers.
@@ -151,14 +160,14 @@ A component should be removable without hunting through unrelated code:
 
 The safest path is mechanical extraction first, behavior changes second:
 
-1. Move shared types/constants to `models.go`. This is already done.
-2. Move database setup and settings helpers to `db.go`.
-3. Move auth/session/rate-limit helpers and handlers to `auth.go`.
-4. Move API token functions and handlers to `tokens.go`.
-5. Move route registration/rendering to `app.go`.
+1. Move shared types/constants to `models.go`. Done.
+2. Move database setup and settings helpers to `db.go`. Done.
+3. Move auth/session/rate-limit helpers and handlers to `auth.go`. Done.
+4. Move API token functions and handlers to `tokens.go`. Done.
+5. Move route registration/rendering to `app.go`. Done.
 6. Move employee/location/role/department persistence and handlers into their files.
 7. Move each document import into its own file.
 8. Move labor/time punch parsing and calculations into `labor.go`.
-9. Move templates and CSS last, because they are noisy and should not obscure behavior changes.
+9. Move templates and CSS last, because they are noisy and should not obscure behavior changes. Done.
 
 After each extraction, run `go test ./...`. Do not combine a large file move with a feature change unless the feature change requires it.

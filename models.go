@@ -70,6 +70,18 @@ type Employee struct {
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
+type EmployeeIdentity struct {
+	ID             int64   `json:"id"`
+	LocationID     int64   `json:"location_id"`
+	EmployeeName   string  `json:"employee_name"`
+	EmployeeNumber string  `json:"employee_number"`
+	Job            string  `json:"job"`
+	RoleName       *string `json:"role_name"`
+	DepartmentName *string `json:"department_name"`
+	EmployeeStatus string  `json:"employee_status"`
+	BirthDate      *string `json:"birth_date"`
+}
+
 type AssignmentStatus struct {
 	RoleUnassigned       int
 	DepartmentUnassigned int

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"mime/multipart"
@@ -56,23 +57,39 @@ func TestConfiguredDBPathKeepsLegacyDefault(t *testing.T) {
 	}
 }
 
-func TestSkillContextDocumentsSDKAndRelativeEndpoints(t *testing.T) {
-	context := skillContext()
-	for _, want := range []string{
-		"# CFASUITE-HR Skill",
-		"CFASUITE_HR_API_KEY",
-		"CFASUITE_HR_BASE_URL",
-		"sdk.NewClientFromEnv()",
-		"GET /api/v1/locations",
-		"GET /api/v1/locations/{storeNumber}/employees",
-		"GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}",
-	} {
-		if !strings.Contains(context, want) {
-			t.Fatalf("skillContext() missing %q", want)
-		}
+func TestUpsertEnvLineCreatesAndReplacesAPIKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shellenv")
+	line := "export CFASUITE_HR_API_KEY=" + shellQuote("cfa_first")
+	if err := upsertEnvLine(path, "CFASUITE_HR_API_KEY", line); err != nil {
+		t.Fatalf("upsertEnvLine create: %v", err)
 	}
-	if strings.Contains(context, "--host") {
-		t.Fatal("skillContext() should not document a --host flag")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read env file: %v", err)
+	}
+	if got, want := string(data), "export CFASUITE_HR_API_KEY='cfa_first'\n"; got != want {
+		t.Fatalf("env file = %q, want %q", got, want)
+	}
+
+	if err := os.WriteFile(path, []byte("export OTHER=value\nCFASUITE_HR_API_KEY=old\n"), 0600); err != nil {
+		t.Fatalf("seed env file: %v", err)
+	}
+	line = "export CFASUITE_HR_API_KEY=" + shellQuote("cfa_second")
+	if err := upsertEnvLine(path, "CFASUITE_HR_API_KEY", line); err != nil {
+		t.Fatalf("upsertEnvLine replace: %v", err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced env file: %v", err)
+	}
+	if got, want := string(data), "export OTHER=value\nexport CFASUITE_HR_API_KEY='cfa_second'\n"; got != want {
+		t.Fatalf("env file after replace = %q, want %q", got, want)
+	}
+}
+
+func TestShellQuoteEscapesSingleQuotes(t *testing.T) {
+	if got, want := shellQuote("cfa_'_key"), "'cfa_'\"'\"'_key'"; got != want {
+		t.Fatalf("shellQuote() = %q, want %q", got, want)
 	}
 }
 
@@ -272,6 +289,63 @@ func TestEmployeeProfileRenders(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "Employee details") || !strings.Contains(body, "Blanco, John") {
 		t.Fatalf("employee profile did not render expected content: %s", body)
+	}
+}
+
+func TestAPIEmployeeIdentityExcludesSensitiveFields(t *testing.T) {
+	db, err := openDB(t.TempDir() + "/test.db")
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	locationID, err := createLocation(db, "Southroads", "03394", "southroads@example.com")
+	if err != nil {
+		t.Fatalf("createLocation: %v", err)
+	}
+	wage := int64(1500)
+	if _, err := db.Exec(`INSERT INTO employees (location_id, employee_name, employee_number, job, wage_rate_cents, wage_pay_type, exclude_from_labor, employee_status, location_latest_start_date, birth_date, clock_in_pin)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, locationID, "Blanco, John", "12-1083836", "Team Member", wage, "hourly", 1, "Active", "2024-10-01", "1999-03-14", "99129"); err != nil {
+		t.Fatalf("insert employee: %v", err)
+	}
+	rawToken, _, err := createToken(db, "test")
+	if err != nil {
+		t.Fatalf("createToken: %v", err)
+	}
+	app, err := newApp(db)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/api/v1/locations/03394/employees/identity", nil)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	rec := httptest.NewRecorder()
+	app.routes().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("identity API status = %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode identity response: %v", err)
+	}
+	employees, ok := payload["employees"].([]any)
+	if !ok || len(employees) != 1 {
+		t.Fatalf("unexpected employees payload: %#v", payload["employees"])
+	}
+	employee, ok := employees[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected employee payload: %#v", employees[0])
+	}
+	for _, field := range []string{"wage_rate_cents", "wage_pay_type", "exclude_from_labor", "clock_in_pin", "location_latest_start_date", "created_at", "updated_at"} {
+		if _, ok := employee[field]; ok {
+			t.Fatalf("identity response exposed %q: %#v", field, employee)
+		}
+	}
+	for _, field := range []string{"id", "location_id", "employee_name", "employee_number", "job", "employee_status", "birth_date"} {
+		if _, ok := employee[field]; !ok {
+			t.Fatalf("identity response missing %q: %#v", field, employee)
+		}
 	}
 }
 
@@ -1710,7 +1784,6 @@ func TestAdminTemplatesRender(t *testing.T) {
 			data: map[string]any{
 				"Title":   "API Docs",
 				"BaseURL": "https://hr.example.com",
-				"Context": apiContext("https://hr.example.com"),
 			},
 		},
 	}

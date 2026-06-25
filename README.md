@@ -54,9 +54,8 @@ cfasuite-hr serve
 cfasuite-hr token create -name "Reporting"
 cfasuite-hr token list
 cfasuite-hr token delete -id 1
-cfasuite-hr api-key-env -api-key cfa_... -base-url https://hr.example.com
-cfasuite-hr skill ./CFASUITE-HR.md
-cfasuite-hr api-context -base-url https://hr.example.com
+cfasuite-hr api-key-env -api-key cfa_...
+cfasuite-hr set-api-key cfa_...
 ```
 
 ## Development
@@ -119,18 +118,20 @@ Authorization: Bearer <token>
 X-API-Token: <token>
 ```
 
-For SDK clients, set:
+For SDK clients, keep the service host in your application's runtime configuration and pass it to the SDK when constructing the client. To print an API key shell export:
 
 ```sh
-export CFASUITE_HR_BASE_URL=https://hr.example.com
-export CFASUITE_HR_API_KEY=cfa_your_token
+cfasuite-hr api-key-env -api-key cfa_your_token
 ```
 
-To print the shell exports:
+To save the API key into your shell environment for future terminals:
 
 ```sh
-cfasuite-hr api-key-env -api-key cfa_your_token -base-url https://hr.example.com
+cfasuite-hr set-api-key cfa_your_token
+source ~/.zshrc
 ```
+
+`set-api-key` writes `CFASUITE_HR_API_KEY` to your shell startup file. It uses `~/.zshrc` for zsh, `~/.bashrc` for bash, and `~/.profile` otherwise. Override the target with `-env-file path`.
 
 Endpoints:
 
@@ -138,6 +139,8 @@ Endpoints:
 GET /api/v1/locations
 GET /api/v1/locations/{storeNumber}/employees
 GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}
+GET /api/v1/locations/{storeNumber}/employees/identity
+GET /api/v1/locations/{storeNumber}/employees/{employeeNumber}/identity
 ```
 
 Store numbers are strings, so leading zeroes such as `03394` are preserved.
@@ -157,44 +160,28 @@ Example:
 
 ```sh
 curl -sS \
-  -H "Authorization: Bearer $CFASUITE_TOKEN" \
+  -H "Authorization: Bearer $CFASUITE_HR_API_KEY" \
   "https://hr.example.com/api/v1/locations/03394/employees"
 ```
-
-To generate a portable skill file for a large language model or another app, write:
-
-```sh
-cfasuite-hr skill ./CFASUITE-HR.md
-```
-
-The generated skill file documents the relative API endpoints, auth headers, data rules, and Go SDK usage without baking in a host.
-
-To generate the older complete copy/paste context block with absolute URLs, pass the public endpoint where the app is running:
-
-```sh
-cfasuite-hr api-context -base-url https://hr.example.com
-```
-
-The generated context includes exact URLs, auth headers, response shapes, birthday behavior, cURL examples, and a Go client example.
 
 ## Go SDK
 
 The Go SDK lives at:
 
 ```go
-import "github.com/phillip-england/cfasuite-hr/sdk"
+import sdk "github.com/phillip-england/cfasuite-hr-sdk"
 ```
 
-Use environment configuration:
+Pass the service host and API key from your application's runtime configuration:
 
 ```go
-client, err := sdk.NewClientFromEnv()
+client, err := sdk.NewClient("https://hr.example.com", apiKey)
 locations, err := client.Locations(ctx)
-employees, err := client.Employees(ctx, "03394")
+employees, err := client.EmployeeIdentities(ctx, "03394")
 employee, err := client.Employee(ctx, "03394", "12-1083836")
 ```
 
-`NewClientFromEnv` requires `CFASUITE_HR_BASE_URL` and `CFASUITE_HR_API_KEY`; its error message tells callers how to set them when they are missing.
+Use `EmployeeIdentities` for basic identity and birthday data. Use `FullEmployees` or `FullEmployee` only when the caller is allowed to read sensitive employee fields such as wages and clock-in PINs.
 
 ## Docker
 
